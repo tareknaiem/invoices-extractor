@@ -5,8 +5,11 @@ Write a standardized DataFrame to a formatted Excel workbook using openpyxl.
 Adds an editable exchange-rate block above the data, an AutoFilter, a frozen
 header row, auto-fitted column widths, and sensible number formats. The
 "EGP Converter" column is populated with live formulas that convert USD/EUR/GBP
-amounts to EGP using the rate cells. An optional ``summary`` dict is written to
-a separate "Summary" sheet.
+amounts to EGP using the rate cells.
+
+A bold Subtotal row ("Total") is appended below the extracted data, carrying
+live ``SUM`` formulas across the exact data range for every financial column.
+An optional ``summary`` dict is written to a separate "Summary" sheet.
 """
 
 from __future__ import annotations
@@ -44,15 +47,44 @@ THIN_BORDER = Border(
 RATE_CELL_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 HINT_FONT = Font(italic=True, color="808080")
 
+# Appended subtotal row.
+TOTAL_LABEL = "Total"  # pass "الاجمالي" to exporter for an Arabic label
+TOTAL_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+TOTAL_FONT = Font(bold=True)
+TOTAL_ALIGNMENT = Alignment(vertical="center")
+# A double top border visually separates the subtotal from the data rows.
+TOTAL_BORDER = Border(
+    left=Side(style="thin", color="D9D9D9"),
+    right=Side(style="thin", color="D9D9D9"),
+    top=Side(style="double", color="1F4E78"),
+    bottom=Side(style="thin", color="D9D9D9"),
+)
 
-def _style_sheet(ws, currency_columns=(), count_columns=(), header_row=HEADER_ROW):
-    """Style a data sheet: header, AutoFilter, freeze, borders, number formats."""
+
+def _header_map(ws, header_row=HEADER_ROW):
+    """Return ``{header_name: column_letter}`` for the sheet's header row."""
+    return {
+        str(cell.value): cell.column_letter
+        for cell in ws[header_row]
+        if cell.value is not None
+    }
+
+
+def _style_sheet(ws, currency_columns=(), count_columns=(), header_row=HEADER_ROW,
+                 data_end_row=None):
+    """Style a data sheet: header, AutoFilter, freeze, borders, number formats.
+
+    ``data_end_row`` limits the AutoFilter to the extracted data (excluding an
+    appended subtotal row); borders and number formats still cover every row.
+    """
     max_row = ws.max_row
     max_col = ws.max_column
     if max_col == 0:
         return
 
-    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(max_col)}{max_row}"
+    if data_end_row is None:
+        data_end_row = max_row
+    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(max_col)}{data_end_row}"
     ws.freeze_panes = f"A{header_row + 1}"
 
     header_map = {}  # column name -> column letter
@@ -146,7 +178,7 @@ def _write_converter_formulas(ws, n_rows):
     Each row computes: EGP + USD*USD_rate + Euros*EUR_rate + GBP*GBP_rate.
     ``N()`` coerces empty/text cells to 0 so blank values don't break the math.
     """
-    header_map = {cell.value: cell.column_letter for cell in ws[HEADER_ROW]}
+    header_map = _header_map(ws)
     conv_col = header_map.get("EGP Converter")
     egp_col = header_map.get("EGP")
     usd_col = header_map.get("USD")
@@ -169,11 +201,67 @@ def _write_converter_formulas(ws, n_rows):
         cell.number_format = "#,##0.00"
 
 
-def export_to_excel(df, output_path, summary=None, sheet_name="Invoices"):
+def _label_column(headers, preferred=("Hotel", "Date", "V.NO", "Notes")):
+    """Pick a text column letter to hold the subtotal label (or ``None``)."""
+    for name in preferred:
+        if name in headers:
+            return headers[name]
+    for name, letter in headers.items():
+        if name not in CURRENCY_COLUMNS and name not in COUNT_COLUMNS:
+            return letter
+    return next(iter(headers.values()), None)
+
+
+def _write_total_row(ws, data_start, data_end, label=TOTAL_LABEL):
+    """Append a subtotal row with live ``SUM`` formulas for the money columns.
+
+    The label is written into a text column (``Hotel``/``Date``/...) and every
+    financial column present gets ``=SUM(<col><data_start>:<col><data_end>)``,
+    covering exactly the extracted data range (the subtotal row itself is
+    excluded, so there is no circular reference).
+
+    Args:
+        ws: The worksheet holding the data.
+        data_start (int): First data row (``HEADER_ROW + 1``).
+        data_end (int): Last data row.
+        label (str): Text for the subtotal label cell.
+
+    Returns:
+        int: The row index of the appended subtotal row.
+    """
+    headers = _header_map(ws)
+    total_row = data_end + 1
+
+    label_col = _label_column(headers)
+    if label_col:
+        ws[f"{label_col}{total_row}"] = label
+
+    for name in CURRENCY_COLUMNS:
+        letter = headers.get(name)
+        if not letter:
+            continue
+        ws[f"{letter}{total_row}"] = f"=SUM({letter}{data_start}:{letter}{data_end})"
+
+    return total_row
+
+
+def _style_total_row(ws, total_row, max_col):
+    """Emphasize the subtotal row: bold, subtle fill, and a double top border."""
+    for column in range(1, max_col + 1):
+        cell = ws.cell(row=total_row, column=column)
+        cell.font = TOTAL_FONT
+        cell.fill = TOTAL_FILL
+        cell.border = TOTAL_BORDER
+        cell.alignment = TOTAL_ALIGNMENT
+
+
+def export_to_excel(df, output_path, summary=None, sheet_name="Invoices",
+                    total_label=TOTAL_LABEL):
     """Write ``df`` (and an optional ``summary`` dict) to a formatted workbook.
 
-    The "Invoices" sheet gets an editable exchange-rate block at the top and a
-    "EGP Converter" column filled with live EGP-conversion formulas.
+    The "Invoices" sheet gets an editable exchange-rate block at the top, a
+    "EGP Converter" column filled with live EGP-conversion formulas, and a bold
+    subtotal row with ``SUM`` formulas across the extracted data range.
 
     Args:
         df (pd.DataFrame): The standardized transactions to export.
@@ -181,6 +269,8 @@ def export_to_excel(df, output_path, summary=None, sheet_name="Invoices"):
         summary (dict, optional): Key/value summary metrics written to a
             separate "Summary" sheet.
         sheet_name (str): Name of the transactions sheet.
+        total_label (str): Label for the appended subtotal row (default
+            ``"Total"``; pass ``"الاجمالي"`` for an Arabic label).
 
     Returns:
         Path: The path to the written workbook.
@@ -206,9 +296,31 @@ def export_to_excel(df, output_path, summary=None, sheet_name="Invoices"):
     wb = load_workbook(output_path)
     ws = wb[sheet_name]
 
+    n_rows = len(df)
+    data_start = HEADER_ROW + 1
+    data_end = HEADER_ROW + n_rows
+
     _write_rate_block(ws)
-    _write_converter_formulas(ws, len(df))
-    _style_sheet(ws, CURRENCY_COLUMNS, COUNT_COLUMNS)
+    _write_converter_formulas(ws, n_rows)
+
+    # Append the subtotal row (only when there is data to total up).
+    total_row = None
+    if n_rows:
+        total_row = _write_total_row(ws, data_start, data_end, total_label)
+
+    _style_sheet(
+        ws,
+        CURRENCY_COLUMNS,
+        COUNT_COLUMNS,
+        data_end_row=data_end if n_rows else None,
+    )
+    if total_row is not None:
+        # Width of the actual table (last header cell), not the rate block.
+        table_cols = max(
+            (cell.column for cell in ws[HEADER_ROW] if cell.value is not None),
+            default=0,
+        )
+        _style_total_row(ws, total_row, table_cols)
     _autofit_columns(ws, start_row=HEADER_ROW)
 
     if summary and "Summary" in wb.sheetnames:

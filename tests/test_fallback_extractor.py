@@ -205,6 +205,75 @@ def test_fallback_export_has_live_egp_formulas():
 
 
 # ---------------------------------------------------------------------------
+# 4b. Subtotal ("Total") row
+# ---------------------------------------------------------------------------
+def test_export_appends_total_row_with_sum_formulas():
+    formatted, _ = extractor_pdf.smart_extract_tables(_mock_tables())
+    n = len(formatted)
+    assert n == 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "with_total.xlsx"
+        exporter.export_to_excel(formatted, out)
+        ws = load_workbook(out)["Invoices"]
+
+        header_row = exporter.HEADER_ROW
+        headers = {str(c.value): c.column_letter for c in ws[header_row]}
+        data_start = header_row + 1
+        data_end = header_row + n
+        total_row = data_end + 1
+
+        # The label sits in a text column (Hotel is preferred).
+        assert ws[f"{headers['Hotel']}{total_row}"].value == "Total"
+
+        # Every financial column gets a SUM over the exact data range.
+        for name in ["EGP Converter", "EGP", "GBP", "Euros", "USD", "Total", "Net"]:
+            letter = headers[name]
+            assert ws[f"{letter}{total_row}"].value == (
+                f"=SUM({letter}{data_start}:{letter}{data_end})"
+            ), name
+
+        # Per-row EGP-converter formulas remain intact (not overwritten).
+        conv = headers["EGP Converter"]
+        for row in range(data_start, data_end + 1):
+            value = ws[f"{conv}{row}"].value
+            assert isinstance(value, str) and value.startswith("=")
+            assert "$B$2" in value and "$D$2" in value and "$F$2" in value
+
+        # Subtotal styling: bold + a double top border.
+        total_cell = ws[f"{headers['USD']}{total_row}"]
+        assert total_cell.font.bold is True
+        assert total_cell.border.top.style == "double"
+
+        # The AutoFilter still covers only the data rows (no subtotal row).
+        assert ws.auto_filter.ref.endswith(str(data_end))
+        assert str(total_row) not in ws.auto_filter.ref
+
+
+def test_export_total_row_label_is_configurable():
+    formatted, _ = extractor_pdf.smart_extract_tables(_mock_tables())
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "arabic_total.xlsx"
+        exporter.export_to_excel(formatted, out, total_label="الاجمالي")
+        ws = load_workbook(out)["Invoices"]
+
+        header_row = exporter.HEADER_ROW
+        headers = {str(c.value): c.column_letter for c in ws[header_row]}
+        total_row = header_row + len(formatted) + 1
+        assert ws[f"{headers['Hotel']}{total_row}"].value == "الاجمالي"
+
+
+def test_export_empty_df_has_no_total_row():
+    formatted, _ = extractor_pdf.smart_extract_tables([])
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "empty.xlsx"
+        exporter.export_to_excel(formatted, out)
+        ws = load_workbook(out)["Invoices"]
+        # Only the header row exists below the rate block; no subtotal appended.
+        assert ws.max_row == exporter.HEADER_ROW
+
+
+# ---------------------------------------------------------------------------
 # 5. End-to-end pipeline with an unknown supplier
 # ---------------------------------------------------------------------------
 def test_detect_supplier_returns_none_for_unknown_text():
