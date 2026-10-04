@@ -514,3 +514,32 @@ def format_transactions(df, supplier_key, rules=None):
         supplier.get("columns_mapping", {}),
         supplier.get("notes_columns", {}),
     )
+
+
+def format_dynamic(df, rules=None, standard_columns=None):
+    """Standardize an unknown-supplier frame with the fuzzy column mapper.
+
+    Builds a fuzzy mapping from the frame's own headers to the standard schema
+    (see :func:`build_column_mapping`), folds any unmapped columns into
+    ``Notes`` so no data is lost, and returns a standard-schema frame. Shared by
+    the smart fallback extractor and the OCR pipeline, whose header text is
+    noisy/unknown.
+
+    Args:
+        df (pd.DataFrame): Raw transactions (source/OCR header names).
+        rules (dict, optional): Parsed rules; loaded from YAML when omitted.
+        standard_columns (list[str], optional): Target schema override.
+
+    Returns:
+        pd.DataFrame: DataFrame whose columns are the standard schema.
+    """
+    if rules is None:
+        rules = load_rules()
+    if standard_columns is None:
+        standard_columns = list(rules["standard_columns"])
+    standard_columns = list(standard_columns)
+
+    headers = list(df.columns)
+    mapping = build_column_mapping(headers, standard_columns)
+    notes_columns = {header: header for header in headers if header not in mapping}
+    return format_with_mapping(df, standard_columns, mapping, notes_columns)

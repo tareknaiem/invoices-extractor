@@ -8,3 +8,15 @@ openpyxl==3.1.5
 # fallback extractor degrades gracefully to the standard-library ``difflib``
 # when rapidfuzz is not installed.
 rapidfuzz==3.14.6
+
+# --- OCR (scanned / image-based PDFs) ----------------------------------------
+# PaddleOCR 3.7.0 runs on top of ``paddlex`` (pulled in automatically); CPU
+# inference additionally needs the ``paddlepaddle`` framework. PaddlePaddle
+# currently ships wheels for CPython 3.9-3.13; on newer interpreters these
+# extras are skipped and the app reports OCR as unavailable while text-based
+# PDFs keep working. PDF pages are rendered by pdfplumber's built-in backend
+# (pypdfium2), so no external poppler install is required.
+paddleocr==3.7.0; python_version < "3.14"
+paddlepaddle==3.3.1; python_version < "3.14"
+# Optional alternative page renderer (requires the poppler system binaries):
+# pdf2image==1.17.0

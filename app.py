@@ -15,6 +15,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import extractor_ocr
 import formatter
 import main
 
@@ -43,13 +44,15 @@ def _standard_columns():
     return list(_rules().get("standard_columns", []))
 
 
-def process_pdf(pdf_bytes: bytes, filename: str, supplier_override: str | None):
+def process_pdf(pdf_bytes: bytes, filename: str, supplier_override: str | None,
+                engine: str = "auto"):
     """Run the full pipeline on a single uploaded PDF.
 
     Args:
         pdf_bytes: Raw PDF file bytes.
         filename: Original uploaded filename (used for the temp file + xlsx).
         supplier_override: Explicit supplier key, or ``None`` to auto-detect.
+        engine: Extraction engine - ``"auto"``, ``"text"`` or ``"ocr"``.
 
     Returns:
         tuple: (formatted DataFrame, summary dict, supplier key, xlsx bytes).
@@ -63,11 +66,13 @@ def process_pdf(pdf_bytes: bytes, filename: str, supplier_override: str | None):
 
         try:
             out_path, formatted, summary, supplier_key = main.run(
-                pdf_path, supplier_key=supplier_override, output_path=xlsx_path
+                pdf_path,
+                supplier_key=supplier_override,
+                output_path=xlsx_path,
+                engine=engine,
             )
-        except SystemExit as exc:
-            # main.run raises SystemExit when supplier auto-detection fails.
-            raise ValueError(f"Could not determine the supplier. {exc}") from exc
+        except extractor_ocr.OcrUnavailableError as exc:
+            raise ValueError(str(exc)) from exc
 
         return formatted, summary, supplier_key, out_path.read_bytes()
 
@@ -79,14 +84,30 @@ with st.sidebar:
     st.header("⚙️ Settings")
 
     st.markdown("**Processing mode**")
-    st.radio(
+    mode = st.radio(
         "Input type",
-        options=["PDF (text-based)", "Image / Scanned (OCR)"],
+        options=["Auto-detect", "PDF (text-based)", "Image / Scanned (OCR)"],
         index=0,
-        disabled=True,
-        help="Only text-based PDFs are supported today. Image/OCR support is planned for a future release.",
+        help=(
+            "Auto-detect uses the text layer when present and falls back to "
+            "OCR for scanned PDFs. Force 'Image / Scanned (OCR)' for "
+            "photographed or image-only invoices; force 'PDF (text-based)' to "
+            "skip OCR."
+        ),
     )
-    st.caption("🖼️ Image / scanned (OCR) support is coming soon.")
+    engine = {
+        "Auto-detect": "auto",
+        "PDF (text-based)": "text",
+        "Image / Scanned (OCR)": "ocr",
+    }[mode]
+
+    if extractor_ocr.is_ocr_available():
+        st.caption("🖼️ OCR ready (PaddleOCR · Arabic).")
+    else:
+        st.caption(
+            "ℹ️ OCR backend (PaddleOCR) not installed — the OCR mode will "
+            "report an error. See requirements.txt."
+        )
 
     st.divider()
 
@@ -138,7 +159,7 @@ if process_clicked:
         )
         try:
             formatted, summary, supplier_key, xlsx_bytes = process_pdf(
-                uploaded.getvalue(), uploaded.name, supplier_override
+                uploaded.getvalue(), uploaded.name, supplier_override, engine
             )
             results.append(
                 {

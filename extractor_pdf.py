@@ -12,6 +12,10 @@ It also provides the *Smart Fallback Extractor* (``smart_extract_tables`` /
 auto-detects the header row, separates summary rows, and fuzzy-maps the columns
 onto the standard schema (via :mod:`formatter`).
 
+When a PDF's fonts lack a ``ToUnicode`` map, text extracts as ``(cid:NN)``
+noise; :func:`has_cid_garbage` detects this so the caller can route the file to
+the OCR pipeline (:mod:`extractor_ocr`).
+
 Dependencies:
     - pdfplumber
     - pandas
@@ -71,12 +75,33 @@ _SUMMARY_WORDS = {
     "المجموع", "مجموع", "الباقي",
 }
 
+# Unmapped-glyph markers emitted when a PDF font lacks a ``ToUnicode`` map,
+# e.g. ``(cid:123)``. They carry no readable text, so they are stripped and used
+# as a signal that the page should be OCR'd instead.
+_CID_RE = re.compile(r"\(cid:\d+\)")
+
+
+def has_cid_garbage(text):
+    """Return True when ``text`` contains unmapped glyphs like ``(cid:123)``.
+
+    PDFs whose fonts lack a ``ToUnicode`` CMap extract as ``(cid:NN)`` noise
+    (common with Arabic and scanned documents). Such files are best routed to
+    the OCR pipeline (:mod:`extractor_ocr`).
+    """
+    return bool(_CID_RE.search(text or ""))
+
+
+def _strip_cid(text):
+    """Remove ``(cid:NN)`` glyph markers and tidy the surrounding whitespace."""
+    return _CID_RE.sub(" ", text)
+
 
 def _clean_cell(value):
     """Normalize a single table cell.
 
     - Converts ``None`` to an empty string.
     - Converts any other value to ``str``.
+    - Removes unmapped ``(cid:NN)`` glyph markers.
     - Removes newline characters and collapses all runs of whitespace into a
       single space, so the final DataFrame is clean and spreadsheet-friendly.
     """
@@ -85,7 +110,7 @@ def _clean_cell(value):
     # ``str.split()`` with no arguments splits on any whitespace (including
     # newlines, tabs, and repeated spaces); joining with a single space both
     # removes newlines and normalizes the remaining whitespace.
-    return " ".join(str(value).split())
+    return " ".join(_strip_cid(str(value)).split())
 
 
 def _clean_currency(value):
@@ -207,13 +232,18 @@ def detect_header_row(table):
     return max(range(len(cleaned)), key=lambda i: _non_empty(cleaned[i]))
 
 
-def _table_to_frame(table):
+def _table_to_frame(table, fix_arabic=True):
     """Convert a single pdfplumber table (list of rows) into a DataFrame.
 
     The header row is auto-detected from text density (see
     :func:`detect_header_row`). Arabic header text is corrected (reversed
     storage), and a second, sparse header row (e.g. currency sub-labels) is
     merged in when it fills empty header cells.
+
+    Args:
+        table (list): Raw table (list of rows).
+        fix_arabic (bool): Reverse visually-reversed Arabic (text-PDF mode).
+            Disable for OCR output, which already returns logical-order text.
     """
     if not table:
         return None
@@ -226,7 +256,9 @@ def _table_to_frame(table):
 
     # Header row is auto-detected from text density (see ``detect_header_row``).
     header_idx = detect_header_row(table)
-    header = [_fix_arabic(cell) for cell in cleaned[header_idx]]
+    header = [
+        (_fix_arabic(cell) if fix_arabic else cell) for cell in cleaned[header_idx]
+    ]
     data_start = header_idx + 1
 
     # Merge a second, sparse header row that fills empty/stacked labels
@@ -240,7 +272,7 @@ def _table_to_frame(table):
         )
         if 0 < next_non_empty < header_non_empty and fills_gap:
             for i, raw in enumerate(next_row):
-                value = _fix_arabic(raw)
+                value = _fix_arabic(raw) if fix_arabic else raw
                 if not value:
                     continue
                 header[i] = f"{header[i]} {value}".strip() if header[i] else value
@@ -360,13 +392,14 @@ def _drop_summary_rows(frame, min_filled=5, arabic_labels_are_summary=True):
     return frame[~(first_is_total | first_is_header | row_is_summary)].reset_index(drop=True)
 
 
-def _clean_dataframe(df):
-    """Apply Arabic correction and currency cleaning to a data frame."""
+def _clean_dataframe(df, fix_arabic=True):
+    """Apply (optional) Arabic correction and currency cleaning to a frame."""
     if df.empty:
         return df
     df = df.copy()
     for col in df.columns:
-        df[col] = df[col].map(_fix_arabic)
+        if fix_arabic:
+            df[col] = df[col].map(_fix_arabic)
         if _is_currency_column(col):
             df[col] = df[col].map(_clean_currency)
     return df
@@ -379,13 +412,41 @@ def get_pdf_text(pdf_path):
         pdf_path (str or pathlib.Path): Path to the PDF file.
 
     Returns:
-        str: All page text joined by newlines.
+        str: All page text joined by newlines, with ``(cid:NN)``
+        unmapped-glyph markers stripped. Use :func:`get_raw_pdf_text` when the
+        markers themselves must be preserved (e.g. OCR auto-routing).
+    """
+    parts = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            parts.append(_strip_cid(page.extract_text() or ""))
+    return "\n".join(parts)
+
+
+def get_raw_pdf_text(pdf_path):
+    """Return the concatenated text of every page, preserving markers.
+
+    Unlike :func:`get_pdf_text`, unmapped-glyph ``(cid:NN)`` markers are kept
+    so :func:`extractor_pdf.has_cid_garbage` and the OCR auto-routing heuristic
+    can detect font-encoding noise.
+
+    Args:
+        pdf_path (str or pathlib.Path): Path to the PDF file.
+
+    Returns:
+        str: All raw page text joined by newlines.
     """
     parts = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             parts.append(page.extract_text() or "")
     return "\n".join(parts)
+
+
+def count_pdf_pages(pdf_path):
+    """Return the number of pages in ``pdf_path``."""
+    with pdfplumber.open(pdf_path) as pdf:
+        return len(pdf.pages)
 
 
 def extract_tables_from_pdf(pdf_path):
@@ -436,7 +497,51 @@ def extract_tables_from_pdf(pdf_path):
     return transactions, summary
 
 
-def smart_extract_tables(tables, rules=None):
+def tables_to_transactions(tables, fix_arabic=True):
+    """Rebuild *raw* (unmapped) transactions + summary from a list of tables.
+
+    Shared by the smart fallback and the OCR pipeline: it applies the same
+    header detection and summary separation, but leaves column naming/mapping to
+    the caller.
+
+    Args:
+        tables (list): Raw tables (each a list of rows of cell strings).
+        fix_arabic (bool): Reverse visually-reversed Arabic (text-PDF mode).
+            Pass ``False`` for OCR output, which is already logical order.
+
+    Returns:
+        tuple[pd.DataFrame, dict]: (raw transactions, summary metrics). The
+        transactions frame keeps the source/OCR header names as its columns.
+    """
+    main_frames = []
+    summary = {}
+
+    for table in tables:
+        if _is_summary_table(table):
+            summary.update(_parse_summary_table(table))
+            continue
+
+        frame = _table_to_frame(table, fix_arabic=fix_arabic)
+        if frame is None or frame.empty:
+            continue
+
+        min_filled = max(2, len(frame.columns) // 2)
+        frame = _drop_summary_rows(
+            frame, min_filled=min_filled, arabic_labels_are_summary=False
+        )
+        if frame.empty:
+            continue
+
+        main_frames.append(frame)
+
+    if not main_frames:
+        return pd.DataFrame(), summary
+
+    raw = pd.concat(main_frames, ignore_index=True)
+    return _clean_dataframe(raw, fix_arabic=fix_arabic), summary
+
+
+def smart_extract_tables(tables, rules=None, fix_arabic=True):
     """Smart fallback: standardize tables from an unknown supplier.
 
     Used when :func:`formatter.detect_supplier` cannot match a profile. Reuses
@@ -457,6 +562,8 @@ def smart_extract_tables(tables, rules=None):
     Args:
         tables (list): Raw pdfplumber tables (each a list of rows).
         rules (dict, optional): Parsed rules; loaded from YAML when omitted.
+        fix_arabic (bool): Reverse visually-reversed Arabic (text-PDF mode).
+            Pass ``False`` for OCR output, which is already logical order.
 
     Returns:
         tuple[pd.DataFrame, dict]: A standard-schema DataFrame (every
@@ -467,42 +574,11 @@ def smart_extract_tables(tables, rules=None):
         rules = formatter.load_rules()
     standard_columns = list(rules["standard_columns"])
 
-    summary = {}
-    main_frames = []
-
-    for table in tables:
-        if _is_summary_table(table):
-            summary.update(_parse_summary_table(table))
-            continue
-
-        frame = _table_to_frame(table)
-        if frame is None or frame.empty:
-            continue
-
-        min_filled = max(2, len(frame.columns) // 2)
-        frame = _drop_summary_rows(
-            frame, min_filled=min_filled, arabic_labels_are_summary=False
-        )
-        if frame.empty:
-            continue
-
-        main_frames.append(frame)
-
-    if not main_frames:
+    raw, summary = tables_to_transactions(tables, fix_arabic=fix_arabic)
+    if raw.empty:
         return pd.DataFrame(columns=standard_columns), summary
 
-    raw = pd.concat(main_frames, ignore_index=True)
-    raw = _clean_dataframe(raw)
-
-    headers = list(raw.columns)
-    mapping = formatter.build_column_mapping(headers, standard_columns)
-    # Fold any column the mapper could not place into Notes (header: value).
-    notes_columns = {header: header for header in headers if header not in mapping}
-
-    formatted = formatter.format_with_mapping(
-        raw, standard_columns, mapping, notes_columns
-    )
-    return formatted, summary
+    return formatter.format_dynamic(raw, standard_columns=standard_columns), summary
 
 
 def smart_fallback_extract(pdf_path, rules=None):
