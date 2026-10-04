@@ -4,3 +4,7 @@ pandas==3.0.6
 numpy==2.5.3
 PyYAML==6.0.3
 openpyxl==3.1.5
+# Fast fuzzy column matching for the dynamic (unknown-supplier) fallback. The
+# fallback extractor degrades gracefully to the standard-library ``difflib``
+# when rapidfuzz is not installed.
+rapidfuzz==3.14.6

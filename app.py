@@ -94,7 +94,11 @@ with st.sidebar:
         "Supplier",
         options=["Auto-detect"] + _supplier_keys(),
         index=0,
-        help="Auto-detect the supplier from the PDF text, or force a specific profile.",
+        help=(
+            "Auto-detect the supplier from the PDF text, or force a specific "
+            "profile. Unknown suppliers are handled automatically by the "
+            "dynamic (fuzzy) fallback extractor."
+        ),
     )
     supplier_override = None if supplier_choice == "Auto-detect" else supplier_choice
 

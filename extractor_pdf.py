@@ -7,6 +7,11 @@ corrects Arabic text that was stored in visual (reversed) order, and separates
 the trailing summary block (Total Invoice / collections / Net) from the main
 reservation rows.
 
+It also provides the *Smart Fallback Extractor* (``smart_extract_tables`` /
+``smart_fallback_extract``): a dynamic engine for unknown/new suppliers that
+auto-detects the header row, separates summary rows, and fuzzy-maps the columns
+onto the standard schema (via :mod:`formatter`).
+
 Dependencies:
     - pdfplumber
     - pandas
@@ -20,6 +25,11 @@ from pathlib import Path
 import pandas as pd
 import pdfplumber
 
+import formatter
+
+
+# Key reported when transactions were extracted by the dynamic fallback engine.
+DYNAMIC_SUPPLIER_KEY = "auto_detected"
 
 # Arabic Unicode blocks (Arabic, Supplement, Extended-A, Presentation Forms A/B).
 _ARABIC_RE = re.compile(
@@ -56,6 +66,9 @@ _SUMMARY_ROW_RE = re.compile(
 _SUMMARY_WORDS = {
     "total", "totals", "subtotal", "sub total", "grand total", "net",
     "collection", "collected", "cost", "costs", "rest", "price", "amount",
+    # Arabic summary labels (also used by the dynamic fallback extractor).
+    "اجمالي", "إجمالي", "الإجمالي", "الاجمالي", "صافي", "الصافي",
+    "المجموع", "مجموع", "الباقي",
 }
 
 
@@ -160,13 +173,47 @@ def _dedupe_columns(columns):
     return result
 
 
+def detect_header_row(table):
+    """Return the index of the table's header row (text-density heuristic).
+
+    The header is the *fullest* row that is at least half non-empty and mostly
+    word-like. Requiring alphabetic content keeps numeric rate/config rows from
+    being mistaken for the column header. Falls back to the single densest row
+    when no row satisfies the word-like rule.
+    """
+    if not table:
+        return 0
+
+    cleaned = [[_clean_cell(cell) for cell in row] for row in table]
+    n_cols = max((len(row) for row in cleaned), default=0)
+
+    def _non_empty(row):
+        return sum(1 for cell in row if cell)
+
+    def _wordy_count(row):
+        return sum(1 for cell in row if cell and any(c.isalpha() for c in str(cell)))
+
+    threshold = max(2, n_cols // 2)
+    candidates = [
+        i
+        for i, row in enumerate(cleaned)
+        if _non_empty(row) >= threshold
+        and _wordy_count(row) >= _non_empty(row) // 2
+    ]
+    if candidates:
+        return max(candidates, key=lambda i: _non_empty(cleaned[i]))
+
+    # Fallback: the row with the most non-empty cells.
+    return max(range(len(cleaned)), key=lambda i: _non_empty(cleaned[i]))
+
+
 def _table_to_frame(table):
     """Convert a single pdfplumber table (list of rows) into a DataFrame.
 
-    The header row is detected as the *first* row where at least half of the
-    cells are filled. Arabic header text is corrected (reversed storage), and a
-    second, sparse header row (e.g. currency sub-labels) is merged in when it
-    fills empty header cells.
+    The header row is auto-detected from text density (see
+    :func:`detect_header_row`). Arabic header text is corrected (reversed
+    storage), and a second, sparse header row (e.g. currency sub-labels) is
+    merged in when it fills empty header cells.
     """
     if not table:
         return None
@@ -177,25 +224,8 @@ def _table_to_frame(table):
     def _non_empty(row):
         return sum(1 for cell in row if cell)
 
-    def _wordy_count(row):
-        return sum(1 for cell in row if cell and any(c.isalpha() for c in str(cell)))
-
-    # Header = the fullest row that is at least half non-empty and mostly
-    # word-like (so numeric "Rate"/configuration rows are not mistaken for a
-    # column header).
-    threshold = max(2, n_cols // 2)
-    candidates = [
-        i
-        for i, row in enumerate(cleaned)
-        if _non_empty(row) >= threshold
-        and _wordy_count(row) >= _non_empty(row) // 2
-    ]
-    if candidates:
-        header_idx = max(candidates, key=lambda i: _non_empty(cleaned[i]))
-    else:
-        # Fallback: the row with the most non-empty cells.
-        header_idx = max(range(len(cleaned)), key=lambda i: _non_empty(cleaned[i]))
-
+    # Header row is auto-detected from text density (see ``detect_header_row``).
+    header_idx = detect_header_row(table)
     header = [_fix_arabic(cell) for cell in cleaned[header_idx]]
     data_start = header_idx + 1
 
@@ -266,7 +296,7 @@ def _parse_summary_table(table):
     return summary
 
 
-def _drop_summary_rows(frame):
+def _drop_summary_rows(frame, min_filled=5, arabic_labels_are_summary=True):
     """Remove repeated-header, total/subtotal and summary rows from a frame.
 
     A row is treated as summary when:
@@ -274,9 +304,17 @@ def _drop_summary_rows(frame):
     * any cell is a ``Label:`` summary cell (``Rest:``, ``Cost:``, ...);
     * any cell starts with a summary keyword (``NET FOR BEBO =``, ...);
     * its first cell is a summary word (``price``, ``t.cost``, ``COLLECTED``,
-      ``COST``, ``Rest``, ...) or an Arabic label;
+      ``COST``, ``Rest``, ...) or, when ``arabic_labels_are_summary``, an Arabic
+      label;
     * its first cell repeats the header (a second page's header row); or
-    * the row is sparse (fewer than five cells filled).
+    * the row is sparse (fewer than ``min_filled`` cells filled).
+
+    Args:
+        frame (pd.DataFrame): The table to filter.
+        min_filled (int): Rows with fewer filled cells are treated as summary.
+            The dynamic fallback lowers this for narrow tables.
+        arabic_labels_are_summary (bool): Treat any Arabic first-cell label as a
+            summary row. The fallback disables this so Arabic *data* is retained.
     """
     if frame.empty:
         return frame
@@ -311,11 +349,11 @@ def _drop_summary_rows(frame):
             first_lower in _SUMMARY_WORDS
             or first_lower.startswith("t.cost")
             or first_lower.startswith("t cost")
-            or _ARABIC_RE.search(first_text)
+            or (arabic_labels_are_summary and _ARABIC_RE.search(first_text))
         ):
             return True
         # Sparse rows (very few filled cells) are placeholders/summaries.
-        return non_empty < 5
+        return non_empty < min_filled
 
     row_is_summary = frame.apply(_row_is_summary, axis=1)
 
@@ -396,6 +434,95 @@ def extract_tables_from_pdf(pdf_path):
     transactions = _clean_dataframe(transactions)
 
     return transactions, summary
+
+
+def smart_extract_tables(tables, rules=None):
+    """Smart fallback: standardize tables from an unknown supplier.
+
+    Used when :func:`formatter.detect_supplier` cannot match a profile. Reuses
+    the same table cleaning and summary separation as
+    :func:`extract_tables_from_pdf`, but replaces the fixed profile mapping with
+    automatic detection:
+
+    * the header row is auto-detected from text density (``_table_to_frame``);
+    * summary/total rows are separated with ``_drop_summary_rows`` (narrow-table
+      friendly settings);
+    * column headers are fuzzy-mapped onto the standard schema with
+      :func:`formatter.build_column_mapping` (including currency-symbol
+      detection), so ``Dt`` / ``Date of Service`` / ``التاريخ`` all become
+      ``Date`` and ``$`` / ``£`` / ``€`` / ``L.E`` headers become currency
+      columns;
+    * any leftover columns are folded into ``Notes`` so no data is lost.
+
+    Args:
+        tables (list): Raw pdfplumber tables (each a list of rows).
+        rules (dict, optional): Parsed rules; loaded from YAML when omitted.
+
+    Returns:
+        tuple[pd.DataFrame, dict]: A standard-schema DataFrame (every
+        ``standard_columns`` entry present, ready for :mod:`exporter`) and the
+        summary metrics dict.
+    """
+    if rules is None:
+        rules = formatter.load_rules()
+    standard_columns = list(rules["standard_columns"])
+
+    summary = {}
+    main_frames = []
+
+    for table in tables:
+        if _is_summary_table(table):
+            summary.update(_parse_summary_table(table))
+            continue
+
+        frame = _table_to_frame(table)
+        if frame is None or frame.empty:
+            continue
+
+        min_filled = max(2, len(frame.columns) // 2)
+        frame = _drop_summary_rows(
+            frame, min_filled=min_filled, arabic_labels_are_summary=False
+        )
+        if frame.empty:
+            continue
+
+        main_frames.append(frame)
+
+    if not main_frames:
+        return pd.DataFrame(columns=standard_columns), summary
+
+    raw = pd.concat(main_frames, ignore_index=True)
+    raw = _clean_dataframe(raw)
+
+    headers = list(raw.columns)
+    mapping = formatter.build_column_mapping(headers, standard_columns)
+    # Fold any column the mapper could not place into Notes (header: value).
+    notes_columns = {header: header for header in headers if header not in mapping}
+
+    formatted = formatter.format_with_mapping(
+        raw, standard_columns, mapping, notes_columns
+    )
+    return formatted, summary
+
+
+def smart_fallback_extract(pdf_path, rules=None):
+    """Extract an unknown-supplier PDF with the smart fallback engine.
+
+    A thin wrapper around :func:`smart_extract_tables` that first pulls every
+    table from ``pdf_path`` with pdfplumber.
+
+    Args:
+        pdf_path (str or pathlib.Path): Path to the PDF file.
+        rules (dict, optional): Parsed rules; loaded from YAML when omitted.
+
+    Returns:
+        tuple[pd.DataFrame, dict]: Standard-schema transactions + summary dict.
+    """
+    tables = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            tables.extend([t for t in (page.extract_tables() or []) if t])
+    return smart_extract_tables(tables, rules)
 
 
 if __name__ == "__main__":

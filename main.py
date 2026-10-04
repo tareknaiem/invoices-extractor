@@ -26,22 +26,27 @@ def run(pdf_path, supplier_key=None, output_path=None):
 
     Returns:
         tuple[Path, pd.DataFrame, dict, str]: (output path, formatted
-        DataFrame, summary dict, supplier key).
+        DataFrame, summary dict, supplier key). When no profile matches, the
+        Smart Fallback Extractor is used and the key is
+        ``extractor_pdf.DYNAMIC_SUPPLIER_KEY``.
     """
     pdf_path = Path(pdf_path)
     rules = formatter.load_rules()
+    suppliers = rules.get("suppliers", {})
 
     if supplier_key is None:
         text = extractor_pdf.get_pdf_text(pdf_path)
         supplier_key = formatter.detect_supplier(text, rules)
-        if supplier_key is None:
-            raise SystemExit(
-                f"Could not auto-detect a supplier from '{pdf_path.name}'. "
-                "Pass an explicit supplier key."
-            )
 
-    transactions, summary = extractor_pdf.extract_tables_from_pdf(pdf_path)
-    formatted = formatter.format_transactions(transactions, supplier_key, rules)
+    # A known supplier uses its configured profile; anything else (detection
+    # returned None, or an unknown key was passed) engages the Smart Fallback
+    # Extractor so new PDFs still produce a standard workbook.
+    if supplier_key in suppliers:
+        transactions, summary = extractor_pdf.extract_tables_from_pdf(pdf_path)
+        formatted = formatter.format_transactions(transactions, supplier_key, rules)
+    else:
+        formatted, summary = extractor_pdf.smart_fallback_extract(pdf_path, rules)
+        supplier_key = extractor_pdf.DYNAMIC_SUPPLIER_KEY
 
     if output_path is None:
         output_path = pdf_path.with_suffix(".xlsx")
