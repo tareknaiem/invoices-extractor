@@ -1,0 +1,151 @@
+# Supplier rules configuration for the invoice extraction pipeline.
+#
+# `standard_columns` is the canonical order of columns used in the
+# standardized Excel output.
+#
+# `suppliers` maps a logical supplier key to:
+#   - `identifiers`: text snippets used to auto-detect the supplier in a PDF.
+#   - `columns_mapping`: a mapping of the supplier's own (possibly localized)
+#     headers to our standard column names.
+#   - `notes_columns`: extra headers (header: label) folded into the "Notes"
+#     standard column so no guest/room/tour details are lost.
+
+standard_columns:
+  - EGP Converter
+  - EGP
+  - GBP
+  - Euros
+  - USD
+  - V.NO
+  - Hotel
+  - Date
+  - Adult
+  - Child
+  - Inf
+  - Total
+  - Notes
+  - Net
+
+suppliers:
+  egypt_gate:
+    identifiers:
+      - "Egypt Gate"
+      - "Sun And Set"
+    columns_mapping:
+      # The current "Egypt Gate" PDF uses English headers (confirmed during
+      # extraction). Map those headers to the standard columns.
+      "Date": "Date"
+      "Agency": "V.NO"
+      "Hotel": "Hotel"
+      "Adult": "Adult"
+      "ch": "Child"
+      "inf": "Inf"
+      "USD": "USD"
+      "EUE": "Euros"
+      "EGP": "EGP"
+      "Cost": "Total"
+    # Extra columns folded into the "Notes" standard column (header: label).
+    notes_columns:
+      "Add Info": "Info"
+      "Name": "Guest"
+      "Room": "Room"
+      "Tour": "Tour"
+      "languge": "Language"
+
+  sharm_gate:
+    identifiers:
+      - "Sharm gate"
+    columns_mapping:
+      # "Sharm gate" invoices (the filename may say "vova tour", but the body
+      # identifies itself as "Sharm gate") use these English headers.
+      "Date": "Date"
+      "Ad.": "Adult"
+      "Ch.": "Child"
+      "Hotel": "Hotel"
+      "Cost": "Total"
+    notes_columns:
+      "Nat.": "Nationality"
+      "Tour": "Tour"
+      "Room": "Room"
+      "Pickup": "Pickup"
+      "Rest": "Rest"
+      "Notes": "Contact"
+
+  egypt_gate_bebo:
+    identifiers:
+      - "Egypt Gate"
+      - "BEBO"
+    columns_mapping:
+      # "EGYPT GATE & BEBO" invoices share the "Egypt Gate" name but use a
+      # different header layout than the main egypt_gate profile.
+      "Date": "Date"
+      "N.": "V.NO"
+      "PAX": "Adult"
+      "HOTEL": "Hotel"
+      "REST $": "USD"
+      "REST €": "Euros"
+      "REST LE": "EGP"
+      "Cost $": "Total"
+    notes_columns:
+      "PROGRAM": "Program"
+      "ROOM": "Room"
+      "Cost LE": "Cost LE"
+
+  egypt_gate_sinai:
+    identifiers:
+      - "Egypt Gate"
+      - "Equipment"
+    columns_mapping:
+      # "Egypt Gaet / Sinai College" — headers are (mostly) already standard.
+      "EGP Conveter": "EGP Converter"
+      "EGP": "EGP"
+      "GBP": "GBP"
+      "Euros": "Euros"
+      "USD": "USD"
+      "V.NO": "V.NO"
+      "Hotel": "Hotel"
+      "Date": "Date"
+      "Adult": "Adult"
+      "Child": "Child"
+      "Inf": "Inf"
+      "Total": "Total"
+      "Net": "Net"
+    notes_columns:
+      "SNK": "SNK"
+      "Equipment": "Equipment"
+      "Payment": "Payment"
+
+  sharm_gate_mohamed:
+    identifiers:
+      - "Voucher No"
+    columns_mapping:
+      # "Sharm gate - Mohamed Kamel" uses a two-row header + Arabic labels.
+      "Voucher No": "V.NO"
+      "pax": "Adult"
+      "ch": "Child"
+      "الفندق": "Hotel"
+      "التاريخ": "Date"
+      "dollar": "USD"
+      "euro": "Euros"
+      "cash L.E": "EGP"
+      "cost le": "Total"
+    notes_columns:
+      "prise": "Price"
+      "cost $": "Cost $"
+      "الرحله": "Trip"
+
+  smile_safari:
+    identifiers:
+      - "smile Safari"
+    columns_mapping:
+      # "Smile Safari" (Sharm gate) — English header with currency placeholders.
+      "DATE": "Date"
+      "HOTEL": "Hotel"
+      "$0": "USD"
+      "£0": "GBP"
+      "€ 0": "Euros"
+      "EGP -": "EGP"
+    notes_columns:
+      "Room": "Room"
+      "TIME": "Time"
+      "رحله": "Trip"

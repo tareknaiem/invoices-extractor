@@ -1,0 +1,6 @@
+streamlit==1.64.0
+pdfplumber==0.11.10
+pandas==3.0.6
+numpy==2.5.3
+PyYAML==6.0.3
+openpyxl==3.1.5
