@@ -199,13 +199,152 @@ def test_paddle_engine_prefers_modern_constructor():
     candidates = extractor_ocr.PaddleOcrEngine._constructor_candidates(
         "ar", "cpu", True
     )
+    # PaddleOCR 3.x takes lang/device/use_textline_orientation. The removed 2.x
+    # `show_log` flag is NOT passed: paddleocr 3.7.0 funnels unknown kwargs into
+    # parse_common_args(), which raises ValueError("Unknown argument: show_log")
+    # rather than a TypeError. _create_ocr_backend only falls through to the
+    # next candidate on TypeError, so show_log would abort the whole backend
+    # with OcrUnavailableError instead of degrading.
     assert candidates[0] == {
         "lang": "ar",
         "device": "cpu",
         "use_textline_orientation": True,
-        "show_log": False,
     }
     assert {"lang": "ar"} in candidates
+
+
+def test_constructor_candidates_avoid_rejected_kwargs():
+    """The candidate used against PaddleOCR 3.x passes no rejected kwarg.
+
+    Regression guard: paddleocr 3.7.0 funnels unknown kwargs into
+    parse_common_args(), which raises ValueError("Unknown argument: ...")
+    rather than a TypeError. _create_ocr_backend only falls through to the next
+    candidate on TypeError, so a stray 2.x-only flag (the original `show_log`)
+    would abort the whole backend with OcrUnavailableError instead of
+    degrading.
+
+    Only the FIRST candidate is checked: it is the one tried against a 3.x
+    install. The remaining `use_angle_cls` / bare-`lang` entries are deliberate
+    2.x fallbacks, reached only after a 3.x backend has already raised
+    TypeError, so validating them against 3.x would be wrong.
+    """
+    import inspect
+
+    try:
+        from paddleocr import PaddleOCR
+
+        params = set(inspect.signature(PaddleOCR.__init__).parameters)
+    except Exception:  # noqa: BLE001 - PaddleOCR not installed here
+        return
+
+    first = extractor_ocr.PaddleOcrEngine._constructor_candidates(
+        "ar", "cpu", True
+    )[0]
+    # Explicit 3.x parameters, plus the common_args forwarded via **kwargs.
+    common_args = {
+        "device", "engine", "engine_config", "enable_hpi", "use_tensorrt",
+        "precision", "enable_mkldnn", "mkldnn_cache_capacity", "cpu_threads",
+        "enable_cinn",
+    }
+    unknown = set(first) - (params | common_args)
+    assert not unknown, f"first candidate {first} passes rejected kwargs: {unknown}"
+
+
+# ---------------------------------------------------------------------------
+# 2b. oneDNN recovery (paddlepaddle 3.x on some Windows CPUs)
+# ---------------------------------------------------------------------------
+def test_recognize_recovers_from_onednn_failure():
+    """A oneDNN NotImplementedError triggers one enable_mkldnn=False rebuild."""
+    onednn_error = NotImplementedError(
+        "(Unimplemented) ConvertPirAttribute2RuntimeAttribute not support "
+        "[pir::ArrayAttribute<pir::DoubleAttribute>]"
+    )
+
+    class _OneDnnBackend:
+        """Fails like the real oneDNN kernels on every predict()."""
+
+        def predict(self, *args, **kwargs):
+            raise onednn_error
+
+    class _WorkingBackend:
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, *args, **kwargs):
+            self.calls += 1
+            return {
+                "rec_texts": ["Total", "EGP"],
+                "rec_scores": [0.9, 0.8],
+                "dt_polys": [
+                    np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=float),
+                    np.array(
+                        [[0, 20], [10, 20], [10, 30], [0, 30]], dtype=float
+                    ),
+                ],
+            }
+
+    rebuilt = _WorkingBackend()
+    seen_kwargs = []
+
+    class _FakePaddleOcr:
+        """Stands in for the PaddleOCR class; records the constructor kwargs."""
+
+        def __new__(cls, **kwargs):
+            seen_kwargs.append(kwargs)
+            return rebuilt
+
+    original_loader = extractor_ocr._load_paddleocr_class
+    original_backend = extractor_ocr.get_ocr_backend
+    extractor_ocr._load_paddleocr_class = lambda: _FakePaddleOcr
+    extractor_ocr.get_ocr_backend = lambda *a, **k: _OneDnnBackend()
+    try:
+        engine = extractor_ocr.PaddleOcrEngine()
+        lines = engine.recognize(np.zeros((40, 80, 3), dtype=np.uint8))
+    finally:
+        extractor_ocr._load_paddleocr_class = original_loader
+        extractor_ocr.get_ocr_backend = original_backend
+
+    # The rebuild happened and disabled oneDNN explicitly.
+    assert seen_kwargs, "expected a oneDNN-free rebuild"
+    assert seen_kwargs[0]["enable_mkldnn"] is False
+    assert seen_kwargs[0]["lang"] == "ar"
+    # The retry succeeded and returned parsed text.
+    assert rebuilt.calls == 1
+    assert [line.text for line in lines] == ["Total", "EGP"]
+
+
+def test_recognize_does_not_swallow_other_notimplemented():
+    """An unrelated NotImplementedError must propagate, not trigger a rebuild."""
+    class _OtherBackend:
+        def predict(self, *args, **kwargs):
+            raise NotImplementedError("something else entirely")
+
+    original_loader = extractor_ocr._load_paddleocr_class
+    original_backend = extractor_ocr.get_ocr_backend
+    calls = []
+    extractor_ocr._load_paddleocr_class = lambda **kwargs: calls.append(kwargs)
+    extractor_ocr.get_ocr_backend = lambda *a, **k: _OtherBackend()
+    try:
+        engine = extractor_ocr.PaddleOcrEngine()
+        try:
+            engine.recognize(np.zeros((40, 80, 3), dtype=np.uint8))
+            assert False, "expected the original NotImplementedError"
+        except NotImplementedError as exc:
+            assert "something else entirely" in str(exc)
+    finally:
+        extractor_ocr._load_paddleocr_class = original_loader
+        extractor_ocr.get_ocr_backend = original_backend
+
+    assert not calls, "must not rebuild for an unrelated error"
+
+
+def test_mkldnn_off_candidates_disable_onednn():
+    """Every rebuild candidate pins enable_mkldnn=False and keeps lang."""
+    candidates = extractor_ocr._mkldnn_off_candidates("ar", "cpu", True)
+    assert candidates
+    for kwargs in candidates:
+        assert kwargs["enable_mkldnn"] is False
+        assert kwargs["lang"] == "ar"
 
 
 class _PredictRecordingBackend:

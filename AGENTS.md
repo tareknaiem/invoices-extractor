@@ -20,10 +20,11 @@ engine="auto", ocr_engine=None, ocr_resolution=None, ocr_max_pages=None)` الت
 
 | المكتبة | الإصدار | الدور |
 |---|---|---|
-| **Python** | 3.14 (بيئة `venv/`) | لغة المشروع؛ ملاحظة: عجلات Paddle تدعم 3.9–3.13 فقط، لذا OCR قد يكون غير متاح على 3.14 |
+| **Python** | 3.11 (بيئة `venv/`) | لغة المشروع؛ ملاحظة: عجلات Paddle تدعم 3.9–3.13 فقط، لذا OCR قد يكون غير متاح على 3.14 |
 | **Streamlit** | 1.64.0 | واجهة الويب في `app.py` (`streamlit run app.py`) |
 | **pdfplumber** | 0.11.10 | استخراج النصوص والجداول من PDF النصي + تحويل الصفحات إلى صور للـ OCR عبر محرك pypdfium2 المدمج |
-| **PaddleOCR / PaddlePaddle** | 3.7.0 / 3.3.1 | محرك OCR العربي (`lang='ar'`) — اختياري، يُستورد بشكل كسول (lazy) ويُبلّغ `OcrUnavailableError` إن غاب |
+| **PaddleOCR / PaddlePaddle** | 3.7.0 / 3.4.0 | محرك OCR العربي (`lang='ar'`) — اختياري، يُستورد بشكل كسول (lazy) ويُبلّغ `OcrUnavailableError` إن غاب |
+| **protobuf** | 7.36.2 (`>=5.26.1,<8`) | القيد المشترك بين streamlit وpaddlepaddle؛ سطر paddlepaddle 2.x يطلب `<=3.20.2` فيتعارض مع streamlit ويسبّب `TypeError: Descriptors cannot be created directly` |
 | **RapidFuzz** | 3.14.6 | مطابقة أعمدة سريعة (Fuzzy) في `formatter`؛ يسقط تلقائيًا إلى `difflib` المكتبة القياسية إن لم يُثبَّت |
 | **OpenPyXL** | 3.1.5 | كتابة ملف الإكسل المنسّق (صيغ حيّة + تنسيقات) |
 | pandas / numpy / PyYAML | 3.0.6 / 2.5.3 / 6.0.3 | جداول البيانات، مصفوفات OCR، قراءة قواعد المورّدين |

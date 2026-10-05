@@ -79,8 +79,11 @@ def _missing_ocr_message():
     message = (
         f"PaddleOCR is not available (missing: {missing_text}). Install the "
         "OCR extras and try again: paddleocr==3.7.0 (pulls paddlex>=3.7.0) "
-        "plus the CPU runtime paddlepaddle==3.3.1 (Windows wheels for Python "
-        "3.9-3.13). Text-based PDFs continue to work without OCR."
+        "plus the CPU runtime paddlepaddle>=3.3.1,<4 (Windows wheels for "
+        "Python 3.9-3.13). The 2.x paddlepaddle line must not be used: it caps "
+        "protobuf<=3.20.2, which conflicts with streamlit's protobuf>=5.26.1. "
+        "Verify with `pip check` and `python -c \"import paddle\"`. Text-based "
+        "PDFs continue to work without OCR."
     )
     details = "; ".join(
         f"{name}: {err}" for name, err in sorted(_OCR_IMPORT_ERRORS.items())
@@ -205,6 +208,31 @@ def ocr_import_errors():
 _OCR_ENGINE_LOCK = threading.RLock()
 _OCR_BACKENDS: dict = {}
 
+# PaddlePaddle 3.x on some Windows CPUs builds the pipeline successfully but
+# then dies on the first predict() inside the oneDNN (MKL-DNN) kernels:
+#   NotImplementedError: (Unimplemented) ConvertPirAttribute2RuntimeAttribute
+#   not support [pir::ArrayAttribute<pir::DoubleAttribute>]
+#   (paddle/fluid/framework/new_executor/instruction/onednn/...)
+# The cure is a backend built with enable_mkldnn=False (verified against
+# paddlepaddle 3.4.0). It is applied as a one-shot rebuild rather than a
+# blanket default so the fast oneDNN path is kept wherever it works
+# (e.g. the Linux deploy target). Substring match on the marker above.
+_ONEDNN_UNIMPLEMENTED = "ConvertPirAttribute2RuntimeAttribute"
+
+
+def _mkldnn_off_candidates(lang, device, orient):
+    """Constructor kwargs for the oneDNN-disabled rebuild, newest API first."""
+    return [
+        {
+            "lang": lang,
+            "device": device,
+            "use_textline_orientation": orient,
+            "enable_mkldnn": False,
+        },
+        {"lang": lang, "device": device, "enable_mkldnn": False},
+        {"lang": lang, "enable_mkldnn": False},
+    ]
+
 
 def reset_ocr_backends():
     """Drop every cached OCR backend (test/maintenance helper)."""
@@ -310,12 +338,6 @@ class PaddleOcrEngine:
         fallbacks so older installs still initialise.
         """
         return [
-            {
-                "lang": lang,
-                "device": device,
-                "use_textline_orientation": orient,
-                "show_log": False,
-            },
             {"lang": lang, "device": device, "use_textline_orientation": orient},
             {"lang": lang, "device": device},
             {"lang": lang, "use_angle_cls": orient},
@@ -329,6 +351,39 @@ class PaddleOcrEngine:
                 self.lang, self.device, self.use_textline_orientation
             )
         return self._ocr
+
+    def _rebuild_without_mkldnn(self):
+        """Replace the cached backend with a oneDNN-free rebuild.
+
+        Only used when :data:`_ONEDNN_UNIMPLEMENTED` is raised: the pipeline
+        constructs fine but every predict() dies inside the oneDNN kernels, so
+        the only cure is a backend built with ``enable_mkldnn=False``. The
+        rebuild replaces the process-wide cache entry, so this happens at most
+        once per worker and later pages reuse the working backend.
+        """
+        key = (self.lang, self.device, self.use_textline_orientation)
+        PaddleOCR = _load_paddleocr_class()
+        last_error = None
+        for kwargs in _mkldnn_off_candidates(
+            self.lang, self.device, self.use_textline_orientation
+        ):
+            try:
+                backend = PaddleOCR(**kwargs)
+            except TypeError as exc:  # backend without enable_mkldnn
+                last_error = exc
+                continue
+            except Exception as exc:  # noqa: BLE001
+                raise OcrUnavailableError(
+                    "PaddleOCR failed to re-initialise with oneDNN disabled "
+                    f"after a {_ONEDNN_UNIMPLEMENTED} error: {exc}"
+                ) from exc
+            with _OCR_ENGINE_LOCK:
+                _OCR_BACKENDS[key] = backend
+            return backend
+        raise OcrUnavailableError(
+            "PaddleOCR could not be re-initialised with oneDNN disabled "
+            f"({last_error!r})."
+        )
 
     @staticmethod
     def _predict(ocr, image):
@@ -365,10 +420,22 @@ class PaddleOcrEngine:
         The backend is the process-wide singleton (PaddleX allows a single
         pipeline initialization per process); inference is serialized because
         the pipeline is not thread-safe.
+
+        A known PaddlePaddle 3.x oneDNN failure (see
+        :data:`_ONEDNN_UNIMPLEMENTED`) is retried once against a rebuilt
+        ``enable_mkldnn=False`` backend; any other error propagates.
         """
         backend = self._ensure_engine()
         with _OCR_ENGINE_LOCK:
-            result = self._predict(backend, image)
+            try:
+                result = self._predict(backend, image)
+            except NotImplementedError as exc:
+                if _ONEDNN_UNIMPLEMENTED not in str(exc):
+                    raise
+                # One-shot, self-healing: the rebuilt backend replaces the
+                # cached one, so this never repeats for later pages.
+                backend = self._rebuild_without_mkldnn()
+                result = self._predict(backend, image)
         return _parse_paddle_result(result)
 
 

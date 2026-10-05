@@ -35,27 +35,34 @@ def _rules():
 
 
 @st.cache_data
-def _supplier_keys():
-    return list(_rules().get("suppliers", {}).keys())
-
-
-@st.cache_data
-def _standard_columns():
+def _standard_column_names():
+    """The canonical standard schema (for the detected-column denominator)."""
     return list(_rules().get("standard_columns", []))
 
 
-def process_pdf(pdf_bytes: bytes, filename: str, supplier_override: str | None,
+@st.cache_data
+def _supplier_keys():
+    """Configured supplier profiles offered in the sidebar selector."""
+    return list(_rules().get("suppliers", {}).keys())
+
+
+def process_pdf(pdf_bytes: bytes, filename: str,
+                supplier_override: str | None = None,
                 engine: str = "auto"):
     """Run the full pipeline on a single uploaded PDF or image (jpg/png).
 
     Args:
         pdf_bytes: Raw PDF/image file bytes.
         filename: Original uploaded filename (used for the temp file + xlsx).
-        supplier_override: Explicit supplier key, or ``None`` to auto-detect.
+        supplier_override: Explicit supplier key to force, or ``None`` to let
+            the pipeline auto-detect (profile when known, Smart Fallback when
+            not).
         engine: Extraction engine - ``"auto"``, ``"text"`` or ``"ocr"``.
 
     Returns:
-        tuple: (formatted DataFrame, summary dict, supplier key, xlsx bytes).
+        tuple: (formatted DataFrame, summary dict, supplier key, detected
+        column count, xlsx bytes). ``supplier_key`` is the matched supplier when
+        a profile was used, else ``extractor_pdf.DYNAMIC_SUPPLIER_KEY``.
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp = Path(tmp_dir)
@@ -74,7 +81,8 @@ def process_pdf(pdf_bytes: bytes, filename: str, supplier_override: str | None,
         except extractor_ocr.OcrUnavailableError as exc:
             raise ValueError(str(exc)) from exc
 
-        return formatted, summary, supplier_key, out_path.read_bytes()
+        detected = main.count_detected_columns(formatted)
+        return formatted, summary, supplier_key, detected, out_path.read_bytes()
 
 
 # ---------------------------------------------------------------------------
@@ -123,17 +131,17 @@ with st.sidebar:
         options=["Auto-detect"] + _supplier_keys(),
         index=0,
         help=(
-            "Auto-detect the supplier from the PDF text, or force a specific "
-            "profile. Unknown suppliers are handled automatically by the "
-            "dynamic (fuzzy) fallback extractor."
+            "Auto-detect uses the supplier profile when the invoice matches a "
+            "known supplier, and Smart Fallback otherwise. Pick a supplier to "
+            "force its curated column mapping."
         ),
     )
     supplier_override = None if supplier_choice == "Auto-detect" else supplier_choice
 
-    st.divider()
-
-    with st.expander("📋 Standard schema"):
-        st.write(_standard_columns())
+    st.caption(
+        "🧠 Auto-detect uses a supplier profile when one matches; unknown "
+        "suppliers are handled by Smart Fallback."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +149,11 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 st.title("🧾 Invoice & Table Extractor Pro")
 st.caption("Upload invoice PDFs or image scans (JPG/JPEG/PNG) and export a standardized Excel workbook.")
+
+st.info(
+    "Processing all invoices with auto-detect... Known suppliers use their "
+    "profile; unknown suppliers fall back to Smart Fallback."
+)
 
 uploaded_files = st.file_uploader(
     "Upload invoice file(s) (PDF or image)",
@@ -165,7 +178,7 @@ if process_clicked:
             (idx - 1) / total, text=f"Processing {uploaded.name} ({idx}/{total})…"
         )
         try:
-            formatted, summary, supplier_key, xlsx_bytes = process_pdf(
+            formatted, summary, supplier_key, detected, xlsx_bytes = process_pdf(
                 uploaded.getvalue(), uploaded.name, supplier_override, engine
             )
             results.append(
@@ -173,6 +186,7 @@ if process_clicked:
                     "name": uploaded.name,
                     "ok": True,
                     "supplier": supplier_key,
+                    "detected": detected,
                     "rows": len(formatted),
                     "formatted": formatted,
                     "summary": summary,
@@ -186,6 +200,7 @@ if process_clicked:
                     "name": uploaded.name,
                     "ok": False,
                     "supplier": None,
+                    "detected": 0,
                     "rows": 0,
                     "formatted": None,
                     "summary": None,
@@ -217,6 +232,12 @@ if results:
         st.subheader("📄 Extracted table (standard schema)")
         st.dataframe(combined)
 
+        total_detected = len(_standard_column_names())
+        st.caption(
+            f"🧠 {len(ok)} invoice(s) · detected columns: "
+            f"{sum(r['detected'] for r in ok)}/{total_detected}"
+        )
+
         st.subheader("⬇️ Download Excel")
         for i, r in enumerate(ok):
             stem = Path(r["name"]).stem
@@ -227,7 +248,11 @@ if results:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"download_{i}_{stem}",
             )
-            st.caption(f"Supplier: `{r['supplier']}` · {r['rows']} rows")
+            st.caption(
+                f"Supplier: {main.supplier_label(r['supplier'])} · "
+                f"{r['detected']}/{total_detected} columns detected · "
+                f"{r['rows']} rows"
+            )
 
     if failed and not ok:
         st.info("No invoices could be processed. Review the errors above and try again.")

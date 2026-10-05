@@ -525,7 +525,14 @@ def tables_to_transactions(tables, fix_arabic=True):
         if frame is None or frame.empty:
             continue
 
-        min_filled = max(2, len(frame.columns) // 2)
+        # Sparsity threshold for placeholder rows. This scales DOWN (never up)
+        # as tables get narrower, matching the fallback's "narrow-table
+        # friendly" intent: a 26-column landscape invoice whose rows only fill
+        # ~8 cells must not be held to 13 filled cells (which would discard
+        # every row and silently yield an empty workbook). Capping at the
+        # _drop_summary_rows default of 5 also keeps this path consistent with
+        # extract_tables_from_pdf, which uses the default threshold.
+        min_filled = min(5, max(2, len(frame.columns) // 2))
         frame = _drop_summary_rows(
             frame, min_filled=min_filled, arabic_labels_are_summary=False
         )

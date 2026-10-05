@@ -7,6 +7,13 @@
 #     no source distribution; a source build or a stalled oversized download
 #     times out the Streamlit Cloud build;
 #   * prefer wheel-backed versions for every dependency.
+#
+# Keeping the venv in sync: a stale paddlepaddle survives `pip install -r`
+# runs that do not name it explicitly, and a 2.x leftover is exactly what
+# breaks protobuf. After changing anything here run:
+#     pip install -r requirements.txt
+#     pip check          # must print "No broken requirements found."
+#     python -c "import extractor_ocr as e; print(e.is_ocr_available())"
 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
 --only-binary paddlepaddle
 --prefer-binary
@@ -39,6 +46,15 @@ rapidfuzz==3.14.6
 # app still runs and reports OCR as unavailable; PDF page rendering uses
 # pdfplumber's built-in pypdfium2 backend (no poppler needed).
 #
+# The 3.x floor is also what keeps the protobuf graph resolvable. The legacy
+# 2.x line is NOT compatible with this stack: paddlepaddle 2.6.2 declares
+# `protobuf>=3.1.0,<=3.20.2` on Windows, which is unsatisfiable next to
+# streamlit's `protobuf>=5.26.1,<8` — pip aborts the whole install with
+# ResolutionImpossible. Worse, if protobuf 5+/7+ is installed anyway (as it is
+# by default today), `import paddle` raises "TypeError: Descriptors cannot be
+# created directly" because 2.6.2 ships pre-protobuf-4 generated _pb2.py
+# files, and OCR silently reports as unavailable. Never relax this below 3.x.
+#
 # Transitive OCR deps resolve from these pins on Linux (verified wheel-only for
 # cp313): paddlex[ocr-core] pulls opencv-contrib-python==4.10.0.84 (cp37-abi3),
 # pyclipper, shapely, python-bidi — all present in the resolved graph. lmdb and
@@ -47,3 +63,13 @@ rapidfuzz==3.14.6
 # Paddle) are not pip packages: see packages.txt.
 paddleocr==3.7.0
 paddlepaddle>=3.3.1,<4
+
+# protobuf is the one shared transitive dependency of streamlit and
+# paddlepaddle, so it is pinned explicitly instead of left to the resolver.
+# It is the intersection of their two constraints and must not be widened:
+#   streamlit 1.64.0  ->  protobuf>=5.26.1,<8
+#   paddlepaddle 3.x  ->  protobuf>=3.20.2   (no upper bound)
+#   => protobuf>=5.26.1,<8   (protobuf 7.36.2 verified working on cp311)
+# The lower bound comes from Streamlit, the upper bound caps the protobuf major
+# so a future 8.x release cannot silently break Streamlit on deploy.
+protobuf>=5.26.1,<8
