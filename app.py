@@ -108,6 +108,13 @@ with st.sidebar:
             "ℹ️ OCR backend (PaddleOCR) not installed — the OCR mode will "
             "report an error. See requirements.txt."
         )
+        # Surface the exact import failure (e.g. a missing system library)
+        # in the UI and the app logs so deploy issues are diagnosable.
+        import_errors = extractor_ocr.ocr_import_errors()
+        for package, error in import_errors.items():
+            st.caption(f"⚠️ `{package}` import failed: `{error}`")
+        if import_errors:
+            print("OCR import failure details:", import_errors)
 
     st.divider()
 

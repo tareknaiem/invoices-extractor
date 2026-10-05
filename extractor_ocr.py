@@ -59,16 +59,34 @@ class OcrUnavailableError(RuntimeError):
     """Raised when the PaddleOCR backend cannot be imported or initialised."""
 
 
+# Exact import failures recorded by ocr_dependency_status():
+# {package: "ExcType: message"} — e.g. ImportError: libGL.so.1: cannot open
+# shared object file. Kept for diagnostics so deploy logs show WHY the OCR
+# backend is unavailable instead of a generic "not installed".
+_OCR_IMPORT_ERRORS = {}
+
+
 def _missing_ocr_message():
-    """Return the actionable installation message shown when OCR is unusable."""
+    """Return the actionable installation message shown when OCR is unusable.
+
+    Includes the exact import exception for every package that failed to
+    import (see :func:`ocr_import_errors`) so the root cause (e.g. a missing
+    system library) is visible in Streamlit Cloud logs.
+    """
     ready, missing = ocr_dependency_status()
     missing_text = ", ".join(missing) if missing and not ready else "paddleocr/paddlepaddle"
-    return (
+    message = (
         f"PaddleOCR is not available (missing: {missing_text}). Install the "
         "OCR extras and try again: paddleocr==3.7.0 (pulls paddlex>=3.7.0) "
         "plus the CPU runtime paddlepaddle==3.3.1 (Windows wheels for Python "
         "3.9-3.13). Text-based PDFs continue to work without OCR."
     )
+    details = "; ".join(
+        f"{name}: {err}" for name, err in sorted(_OCR_IMPORT_ERRORS.items())
+    )
+    if details:
+        message += f" Import errors: {details}"
+    return message
 
 
 def require_ocr_engine(engine=None, lang=OCR_LANG):
@@ -143,15 +161,34 @@ def ocr_dependency_status():
 
     ``ready`` is True only when both ``paddleocr`` and the ``paddle``
     inference runtime (``paddlepaddle``) import. ``missing`` names the packages
-    that could not be imported.
+    that could not be imported. The exact exception raised by each failed
+    import is recorded in ``_OCR_IMPORT_ERRORS`` and exposed by
+    :func:`ocr_import_errors` for diagnostics.
     """
     missing = []
     for module in ("paddleocr", "paddle"):
+        package = "paddleocr" if module == "paddleocr" else "paddlepaddle"
         try:
             __import__(module)
-        except Exception:  # noqa: BLE001 - keep probing the remaining packages
-            missing.append("paddleocr" if module == "paddleocr" else "paddlepaddle")
+        except Exception as exc:  # noqa: BLE001 - keep probing the remaining packages
+            missing.append(package)
+            _OCR_IMPORT_ERRORS[package] = f"{type(exc).__name__}: {exc}"
+        else:
+            _OCR_IMPORT_ERRORS.pop(package, None)
     return (not missing, tuple(missing))
+
+
+def ocr_import_errors():
+    """Return ``{package: "ExcType: message"}`` for failed OCR imports.
+
+    Re-probes the imports so the recorded details always reflect the current
+    environment — e.g. ``ImportError: libGL.so.1: cannot open shared object
+    file`` when OpenCV's system libraries are missing on a headless box, or
+    ``ModuleNotFoundError`` when the wheels were never installed. Returns an
+    empty dict when the whole OCR stack imports.
+    """
+    ocr_dependency_status()
+    return dict(_OCR_IMPORT_ERRORS)
 
 
 class PaddleOcrEngine:

@@ -519,6 +519,60 @@ def test_image_pipeline_maps_to_standard_schema_and_exports():
 
 
 # ---------------------------------------------------------------------------
+# 6c. Exact import-failure diagnostics (ocr_import_errors)
+# ---------------------------------------------------------------------------
+def test_ocr_import_errors_captures_exact_exception():
+    """A failed import is recorded as "ExcType: message", not swallowed."""
+    import sys
+
+    sentinel = object()
+    saved = sys.modules.pop("paddle", sentinel)
+    # ``None`` in sys.modules makes ``__import__("paddle")`` raise ImportError.
+    sys.modules["paddle"] = None
+    try:
+        ready, missing = extractor_ocr.ocr_dependency_status()
+        assert "paddlepaddle" in missing
+        assert ready is False
+
+        errors = extractor_ocr.ocr_import_errors()
+        detail = errors["paddlepaddle"]
+        # Python raises ImportError or its subclass ModuleNotFoundError here;
+        # the exact type + message must be preserved verbatim.
+        assert detail.startswith(("ImportError", "ModuleNotFoundError")), detail
+        assert "paddle" in detail.lower()
+    finally:
+        if saved is sentinel:
+            sys.modules.pop("paddle", None)
+        else:
+            sys.modules["paddle"] = saved
+        # Re-probe so recorded errors match the real environment again.
+        extractor_ocr.ocr_dependency_status()
+
+
+def test_ocr_import_errors_reflect_environment():
+    errors = extractor_ocr.ocr_import_errors()
+    if extractor_ocr.is_ocr_available():
+        assert errors == {}
+    else:
+        assert errors, "unavailable OCR must expose exact import errors"
+        for detail in errors.values():
+            exc_name = detail.split(":", 1)[0].strip()
+            assert exc_name and ":" in detail, detail
+
+
+def test_missing_ocr_message_includes_import_details():
+    if extractor_ocr.is_ocr_available():
+        print("      (skipped: PaddleOCR is installed)")
+        return
+    message = extractor_ocr._missing_ocr_message()
+    # The actionable base message stays intact for existing consumers...
+    assert "Text-based PDFs continue to work" in message
+    assert "PaddleOCR" in message
+    # ...and the exact import failures are appended.
+    assert "Import errors:" in message
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner (no pytest required)
 # ---------------------------------------------------------------------------
 def _run_all():
