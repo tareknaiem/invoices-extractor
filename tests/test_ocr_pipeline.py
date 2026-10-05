@@ -573,6 +573,72 @@ def test_missing_ocr_message_includes_import_details():
 
 
 # ---------------------------------------------------------------------------
+# 6d. Process-wide singleton backend (Streamlit rerun safety)
+# ---------------------------------------------------------------------------
+def test_ocr_backend_created_once_across_reruns():
+    """Two engines (== two Streamlit reruns) must share ONE backend instance.
+
+    PaddleX aborts with "PDX has already been initialized" whenever a second
+    pipeline is constructed in the same process.
+    """
+    created = []
+
+    class _FakePaddleOcr:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def predict(self, *args, **kwargs):
+            return []
+
+    original_available = extractor_ocr.is_ocr_available
+    original_loader = extractor_ocr._load_paddleocr_class
+    extractor_ocr.is_ocr_available = lambda: True
+    extractor_ocr._load_paddleocr_class = lambda: _FakePaddleOcr
+    try:
+        extractor_ocr.reset_ocr_backends()
+
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        first = extractor_ocr.PaddleOcrEngine()
+        second = extractor_ocr.PaddleOcrEngine()  # e.g. the next Streamlit rerun
+        assert first.recognize(image) == []
+        assert second.recognize(image) == []
+
+        assert first._ensure_engine() is second._ensure_engine()
+        assert len(created) == 1, f"PaddleOCR must be built once, got {len(created)}"
+        assert created[0]["lang"] == extractor_ocr.OCR_LANG
+    finally:
+        extractor_ocr.is_ocr_available = original_available
+        extractor_ocr._load_paddleocr_class = original_loader
+        extractor_ocr.reset_ocr_backends()
+
+
+def test_ocr_backend_cache_is_keyed_by_configuration():
+    """Different OCR configurations get their own pipeline; identical ones share."""
+    created = []
+
+    class _FakePaddleOcr:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    original_available = extractor_ocr.is_ocr_available
+    original_loader = extractor_ocr._load_paddleocr_class
+    extractor_ocr.is_ocr_available = lambda: True
+    extractor_ocr._load_paddleocr_class = lambda: _FakePaddleOcr
+    try:
+        extractor_ocr.reset_ocr_backends()
+        arabic = extractor_ocr.get_ocr_backend("ar", "cpu", True)
+        english = extractor_ocr.get_ocr_backend("en", "cpu", True)
+        again = extractor_ocr.get_ocr_backend("ar", "cpu", True)
+        assert arabic is again
+        assert arabic is not english
+        assert [call["lang"] for call in created] == ["ar", "en"]
+    finally:
+        extractor_ocr.is_ocr_available = original_available
+        extractor_ocr._load_paddleocr_class = original_loader
+        extractor_ocr.reset_ocr_backends()
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner (no pytest required)
 # ---------------------------------------------------------------------------
 def _run_all():

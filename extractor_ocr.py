@@ -26,6 +26,7 @@ available for CPython 3.9-3.13).
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -191,15 +192,104 @@ def ocr_import_errors():
     return dict(_OCR_IMPORT_ERRORS)
 
 
+# ---------------------------------------------------------------------------
+# Process-wide OCR backend singleton
+# ---------------------------------------------------------------------------
+# PaddleX (the framework behind PaddleOCR 3.x) allows exactly ONE pipeline
+# initialization per process; a second ``PaddleOCR(...)`` aborts with "PDX has
+# already been initialized. Reinitialization is not supported." Streamlit
+# re-runs the app script on every interaction and processes several uploads per
+# run, so a per-object engine would re-initialize and fail. The backend is
+# therefore built exactly once per worker process and shared; construction and
+# inference are serialized because the pipeline is not thread-safe.
+_OCR_ENGINE_LOCK = threading.RLock()
+_OCR_BACKENDS: dict = {}
+
+
+def reset_ocr_backends():
+    """Drop every cached OCR backend (test/maintenance helper)."""
+    with _OCR_ENGINE_LOCK:
+        _OCR_BACKENDS.clear()
+
+
+def _load_paddleocr_class():
+    """Import and return the ``PaddleOCR`` class, or ``None`` when missing."""
+    try:
+        from paddleocr import PaddleOCR
+    except Exception as exc:  # noqa: BLE001
+        raise OcrUnavailableError(
+            "PaddleOCR is not installed. Install the OCR extras "
+            "(paddleocr + paddlepaddle) to use the scanned-invoice mode. "
+            f"Original error: {exc}"
+        ) from exc
+    return PaddleOCR
+
+
+def _create_ocr_backend(lang, device, orient):
+    """Build a new PaddleOCR backend, degrading across constructor spellings."""
+    if not is_ocr_available():
+        raise OcrUnavailableError(_missing_ocr_message())
+    PaddleOCR = _load_paddleocr_class()
+    # A test or user seam may patch availability without supplying the real
+    # PaddleOCR package. In that case fail loudly before attempting to use
+    # a lightweight stand-in as if it were the trained backend.
+    if PaddleOCR is None:
+        raise OcrUnavailableError(_missing_ocr_message())
+
+    # The constructor signature changed across PaddleOCR releases; try the
+    # richer 3.x form first and degrade gracefully to the 2.x spellings.
+    last_error = None
+    for kwargs in PaddleOcrEngine._constructor_candidates(lang, device, orient):
+        try:
+            return PaddleOCR(**kwargs)
+        except TypeError as exc:
+            last_error = exc
+            continue
+        except Exception as exc:  # noqa: BLE001
+            raise OcrUnavailableError(
+                f"Could not initialise PaddleOCR (lang={lang!r}): {exc}"
+            ) from exc
+    raise OcrUnavailableError(f"Could not initialise PaddleOCR: {last_error!r}")
+
+
+def get_ocr_backend(lang=OCR_LANG, device="cpu", use_textline_orientation=True):
+    """Return the shared PaddleOCR backend, creating it exactly once.
+
+    Keyed by ``(lang, device, use_textline_orientation)``: identical
+    configurations reuse the single instance PaddleX allows per process
+    (Streamlit reruns and multi-file runs included), while genuinely different
+    configurations still get their own pipeline.
+
+    Args:
+        lang (str): PaddleOCR language code.
+        device (str): Inference device (``"cpu"`` for CPU-only deployment).
+        use_textline_orientation (bool): Text-line orientation detection flag.
+
+    Returns:
+        object: The shared ``PaddleOCR`` instance.
+
+    Raises:
+        OcrUnavailableError: When the stack cannot be imported or initialised.
+    """
+    key = (lang, device, use_textline_orientation)
+    with _OCR_ENGINE_LOCK:
+        backend = _OCR_BACKENDS.get(key)
+        if backend is None:
+            backend = _create_ocr_backend(lang, device, use_textline_orientation)
+            _OCR_BACKENDS[key] = backend
+        return backend
+
+
 class PaddleOcrEngine:
     """Lazy wrapper around PaddleOCR configured for Arabic (``lang='ar'``).
 
     Targets the PaddleOCR 3.x pipeline API (``PaddleOCR(lang=..., device="cpu",
     use_textline_orientation=...)`` + ``predict(input=<numpy array>)``) and
     degrades gracefully to the legacy 2.x spellings (``use_angle_cls`` +
-    ``ocr(...)``). Instantiation is deferred until the first
-    :meth:`recognize` call so the (slow, model-loading) backend is only built
-    when OCR is actually used.
+    ``ocr(...)``). Instantiation is deferred until the first :meth:`recognize`
+    call, and the resulting backend is the process-wide singleton returned by
+    :func:`get_ocr_backend` — PaddleX permits only one pipeline initialization
+    per process, which Streamlit's script reruns would otherwise violate.
     """
 
     def __init__(self, lang=OCR_LANG, device="cpu", use_textline_orientation=True):
@@ -233,40 +323,12 @@ class PaddleOcrEngine:
         ]
 
     def _ensure_engine(self):
-        if self._ocr is not None:
-            return
-        if not is_ocr_available():
-            raise OcrUnavailableError(_missing_ocr_message())
-        try:
-            from paddleocr import PaddleOCR
-        except Exception as exc:  # noqa: BLE001
-            raise OcrUnavailableError(
-                "PaddleOCR is not installed. Install the OCR extras "
-                "(paddleocr + paddlepaddle) to use the scanned-invoice mode. "
-                f"Original error: {exc}"
-            ) from exc
-
-        # A test or user seam may patch availability without supplying the real
-        # PaddleOCR package. In that case fail loudly before attempting to use
-        # a lightweight stand-in as if it were the trained backend.
-        if PaddleOCR is None:
-            raise OcrUnavailableError(_missing_ocr_message())
-
-        # The constructor signature changed across PaddleOCR releases; try the
-        # richer 3.x form first and degrade gracefully to the 2.x spellings.
-        for kwargs in self._constructor_candidates(
-            self.lang, self.device, self.use_textline_orientation
-        ):
-            try:
-                self._ocr = PaddleOCR(**kwargs)
-                return
-            except TypeError:
-                continue
-            except Exception as exc:  # noqa: BLE001
-                raise OcrUnavailableError(
-                    f"Could not initialise PaddleOCR (lang={self.lang!r}): {exc}"
-                ) from exc
-        raise OcrUnavailableError("Could not initialise PaddleOCR.")
+        """Return the shared backend, building it once per process."""
+        if self._ocr is None:
+            self._ocr = get_ocr_backend(
+                self.lang, self.device, self.use_textline_orientation
+            )
+        return self._ocr
 
     @staticmethod
     def _predict(ocr, image):
@@ -298,9 +360,16 @@ class PaddleOcrEngine:
         )
 
     def recognize(self, image):
-        """Run OCR on ``image`` and return a list of :class:`OcrLine`."""
-        self._ensure_engine()
-        return _parse_paddle_result(self._predict(self._ocr, image))
+        """Run OCR on ``image`` and return a list of :class:`OcrLine`.
+
+        The backend is the process-wide singleton (PaddleX allows a single
+        pipeline initialization per process); inference is serialized because
+        the pipeline is not thread-safe.
+        """
+        backend = self._ensure_engine()
+        with _OCR_ENGINE_LOCK:
+            result = self._predict(backend, image)
+        return _parse_paddle_result(result)
 
 
 # ---------------------------------------------------------------------------
