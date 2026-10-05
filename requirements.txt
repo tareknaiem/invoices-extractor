@@ -1,4 +1,15 @@
 # Invoices Extractor — runtime dependencies (Streamlit Cloud / Linux + local).
+#
+# Install policy — prebuilt CPU wheels, fast on Linux deploy boxes:
+#   * the official PaddlePaddle CPU wheel index is added as an extra source
+#     (PyPI stays active) so paddlepaddle downloads from Paddle's CDN;
+#   * paddlepaddle is wheel-only — it ships ~193MB prebuilt CPU wheels and has
+#     no source distribution; a source build or a stalled oversized download
+#     times out the Streamlit Cloud build;
+#   * prefer wheel-backed versions for every dependency.
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
+--only-binary paddlepaddle
+--prefer-binary
 
 # --- Core application -------------------------------------------------------
 streamlit==1.64.0
@@ -18,12 +29,14 @@ PyYAML==6.0.2
 rapidfuzz==3.14.6
 
 # --- OCR for scanned / Arabic invoices (optional at runtime) ----------------
-# paddleocr ships a universal wheel; paddlepaddle ships manylinux wheels for
-# CPython 3.9-3.13 only (no cp314 wheels exist yet), so the interpreter that
-# runs `pip install -r requirements.txt` must be <=3.13. On Streamlit Cloud pick
-# Python 3.13 in "Advanced settings" when deploying (version files such as
-# .python-version are not honored by the platform). Without paddlepaddle the
-# app still runs and reports OCR as unavailable; PDF page
-# rendering uses pdfplumber's built-in pypdfium2 backend (no poppler needed).
+# paddleocr ships a universal wheel. paddlepaddle ships ~193MB prebuilt CPU
+# wheels only (no sdist) for CPython 3.9-3.13 — no cp314 wheels exist on any
+# index yet, so the deploy interpreter must be <=3.13: on Streamlit Cloud pick
+# Python 3.13 in "Advanced settings" (version files such as .python-version
+# are not honored by the platform). The >=3.3.1,<4 range makes pip take the
+# current CPU wheels from the official index above (3.4.x on Linux/Windows)
+# while older platforms fall back to 3.3.1 on PyPI. Without paddlepaddle the
+# app still runs and reports OCR as unavailable; PDF page rendering uses
+# pdfplumber's built-in pypdfium2 backend (no poppler needed).
 paddleocr==3.7.0
-paddlepaddle==3.3.1
+paddlepaddle>=3.3.1,<4
