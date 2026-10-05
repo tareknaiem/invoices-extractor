@@ -41,6 +41,10 @@ import formatter
 DEFAULT_RESOLUTION = 300
 OCR_LANG = "ar"
 
+# Direct image files (jpg/jpeg/png) accepted alongside PDFs. They have no text
+# layer, so they always route through the OCR pipeline (see ``is_image_path``).
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
 # Row grouping: two boxes belong to the same row when their vertical centres are
 # within ``ROW_Y_TOLERANCE`` * the median text-line height.
 ROW_Y_TOLERANCE = 0.6
@@ -527,6 +531,57 @@ def extract_transactions_from_pdf(pdf_path, rules=None, engine=None,
     tables, ocr_text = extract_tables_from_images(
         pdf_path, engine=engine, resolution=resolution, max_pages=max_pages
     )
+    raw, summary = extractor_pdf.tables_to_transactions(tables, fix_arabic=False)
+    return raw, summary, ocr_text
+
+
+def is_image_path(path):
+    """Return True when ``path`` points at a direct image file (jpg/jpeg/png)."""
+    return Path(path).suffix.lower() in IMAGE_SUFFIXES
+
+
+def extract_tables_from_image(image_path, engine=None):
+    """OCR a single image file into ``(tables, ocr_text)``.
+
+    Unlike :func:`extract_tables_from_images`, the file is loaded directly (no
+    page rendering / DPI options) and recognised as one table grid.
+
+    Args:
+        image_path (str or pathlib.Path): Path to a jpg/jpeg/png file.
+        engine (object, optional): OCR engine exposing ``recognize(image)``.
+            Defaults to :class:`PaddleOcrEngine` (Arabic).
+
+    Returns:
+        tuple[list, str]: ``(tables, ocr_text)`` - a list holding at most one
+        reconstructed grid, and all recognised text joined by newlines.
+    """
+    engine = require_ocr_engine(engine)
+    from PIL import Image
+
+    with Image.open(image_path) as image:
+        array = _pil_to_array(image)
+    lines = engine.recognize(array)
+    table = lines_to_table(lines, page_width=array.shape[1])
+    return ([table] if table else []), "\n".join(line.text for line in lines)
+
+
+def extract_transactions_from_image(image_path, engine=None):
+    """OCR a single image file and return ``(raw_transactions, summary, ocr_text)``.
+
+    Mirrors :func:`extract_transactions_from_pdf` for direct image uploads
+    (jpg/jpeg/png): recognised lines are rebuilt into a table and run through
+    the shared dynamic pipeline (``fix_arabic=False`` - Paddle already returns
+    logical-order text). Map the result with :func:`formatter.format_dynamic`
+    (see :func:`main.run`).
+
+    Args:
+        image_path (str or pathlib.Path): Path to a jpg/jpeg/png file.
+        engine (object, optional): OCR engine (defaults to Arabic PaddleOCR).
+
+    Returns:
+        tuple[pd.DataFrame, dict, str]: (raw transactions, summary, OCR text).
+    """
+    tables, ocr_text = extract_tables_from_image(image_path, engine=engine)
     raw, summary = extractor_pdf.tables_to_transactions(tables, fix_arabic=False)
     return raw, summary, ocr_text
 

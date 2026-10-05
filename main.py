@@ -9,6 +9,9 @@ Two extraction engines are available:
   :mod:`extractor_ocr`);
 * ``"auto"`` - pick automatically: OCR when the PDF has no usable text layer
   (empty text or ``(cid:...)`` font-encoding noise).
+
+Direct image inputs (``.jpg``/``.jpeg``/``.png``) have no text layer at all, so
+they always run through the OCR pipeline regardless of ``engine``.
 """
 
 from __future__ import annotations
@@ -46,14 +49,15 @@ def run(pdf_path, supplier_key=None, output_path=None, engine="auto",
     """Run the full pipeline for a single invoice PDF.
 
     Args:
-        pdf_path (str or Path): Path to the invoice PDF.
+        pdf_path (str or Path): Path to the invoice PDF or image file (jpg/png).
         supplier_key (str, optional): Supplier key used to look up the column
             mapping. When omitted, the supplier is auto-detected from the PDF
             text using the identifiers in ``suppliers_rules.yaml``.
         output_path (str or Path, optional): Destination ``.xlsx``; defaults to
             the PDF path with an ``.xlsx`` extension.
         engine (str): Extraction engine - ``"auto"`` (default), ``"text"`` or
-            ``"ocr"``.
+            ``"ocr"``. Direct image files (jpg/png) always use OCR and ignore
+            this flag plus ``ocr_resolution``/``ocr_max_pages``.
         ocr_engine (object, optional): OCR engine override (advanced/testing);
             must expose ``recognize(image)``.
         ocr_resolution (int, optional): OCR rendering DPI override.
@@ -70,17 +74,24 @@ def run(pdf_path, supplier_key=None, output_path=None, engine="auto",
     suppliers = rules.get("suppliers", {})
     standard_columns = list(rules["standard_columns"])
 
-    if _resolve_engine(engine, pdf_path):
-        # OCR pipeline (scanned / image PDFs, or forced via engine="ocr").
-        ocr_kwargs = {}
-        if ocr_resolution is not None:
-            ocr_kwargs["resolution"] = ocr_resolution
-        if ocr_max_pages is not None:
-            ocr_kwargs["max_pages"] = ocr_max_pages
+    is_image = extractor_ocr.is_image_path(pdf_path)
+    if is_image or _resolve_engine(engine, pdf_path):
+        # OCR pipeline (scanned / image PDFs, forced via engine="ocr", or a
+        # direct image upload - jpg/jpeg/png always OCR regardless of engine).
+        if is_image:
+            raw, summary, ocr_text = extractor_ocr.extract_transactions_from_image(
+                pdf_path, engine=ocr_engine
+            )
+        else:
+            ocr_kwargs = {}
+            if ocr_resolution is not None:
+                ocr_kwargs["resolution"] = ocr_resolution
+            if ocr_max_pages is not None:
+                ocr_kwargs["max_pages"] = ocr_max_pages
 
-        raw, summary, ocr_text = extractor_ocr.extract_transactions_from_pdf(
-            pdf_path, rules=rules, engine=ocr_engine, **ocr_kwargs
-        )
+            raw, summary, ocr_text = extractor_ocr.extract_transactions_from_pdf(
+                pdf_path, rules=rules, engine=ocr_engine, **ocr_kwargs
+            )
         if supplier_key is None:
             supplier_key = formatter.detect_supplier(ocr_text, rules)
         # OCR header text is noisy, so always use the fuzzy dynamic mapper.

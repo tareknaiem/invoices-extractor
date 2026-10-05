@@ -46,10 +46,10 @@ def _standard_columns():
 
 def process_pdf(pdf_bytes: bytes, filename: str, supplier_override: str | None,
                 engine: str = "auto"):
-    """Run the full pipeline on a single uploaded PDF.
+    """Run the full pipeline on a single uploaded PDF or image (jpg/png).
 
     Args:
-        pdf_bytes: Raw PDF file bytes.
+        pdf_bytes: Raw PDF/image file bytes.
         filename: Original uploaded filename (used for the temp file + xlsx).
         supplier_override: Explicit supplier key, or ``None`` to auto-detect.
         engine: Extraction engine - ``"auto"``, ``"text"`` or ``"ocr"``.
@@ -133,13 +133,13 @@ with st.sidebar:
 # Main area
 # ---------------------------------------------------------------------------
 st.title("🧾 Invoice & Table Extractor Pro")
-st.caption("Upload invoice PDFs and export a standardized Excel workbook.")
+st.caption("Upload invoice PDFs or image scans (JPG/JPEG/PNG) and export a standardized Excel workbook.")
 
 uploaded_files = st.file_uploader(
-    "Upload invoice PDF(s)",
-    type=["pdf", "PDF"],
+    "Upload invoice file(s) (PDF or image)",
+    type=["pdf", "PDF", "jpg", "JPG", "jpeg", "JPEG", "png", "PNG"],
     accept_multiple_files=True,
-    help="Select one or more invoice PDF files to process.",
+    help="Select one or more invoice files to process: PDF documents or direct images (jpg/jpeg/png).",
 )
 
 process_clicked = st.button(

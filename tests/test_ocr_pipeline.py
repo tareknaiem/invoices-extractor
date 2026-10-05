@@ -459,6 +459,66 @@ def test_ocr_unavailable_reports_cleanly():
 
 
 # ---------------------------------------------------------------------------
+# 6b. Direct image uploads (jpg/jpeg/png)
+# ---------------------------------------------------------------------------
+def test_is_image_path_detects_images():
+    assert extractor_ocr.is_image_path("invoice.jpg") is True
+    assert extractor_ocr.is_image_path("invoice.JPEG") is True
+    assert extractor_ocr.is_image_path("scan.png") is True
+    assert extractor_ocr.is_image_path("invoice.pdf") is False
+    assert extractor_ocr.is_image_path("invoice.PDF") is False
+    assert extractor_ocr.is_image_path("report.xlsx") is False
+
+
+def test_image_pipeline_maps_to_standard_schema_and_exports():
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - Pillow ships with Streamlit
+        print("      (skipped: Pillow not installed)")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        image_path = Path(tmp) / "invoice.png"
+        Image.new("RGB", (900, 200), "white").save(image_path)
+
+        engine = _FakeEngine(_fake_lines())
+        raw, summary, ocr_text = extractor_ocr.extract_transactions_from_image(
+            image_path, engine=engine
+        )
+        assert engine.calls == 1
+        assert "Hurghada" in ocr_text
+
+        formatted = formatter.format_dynamic(raw)
+        assert list(formatted.columns) == STANDARD_COLUMNS
+        assert len(formatted) == 2
+        assert list(formatted["Hotel"]) == ["Hurghada", "Cairo"]
+
+        # End-to-end: main.run routes the image to OCR and exports live formulas.
+        out_path = Path(tmp) / "image_out.xlsx"
+        out, formatted, summary, supplier_key = main.run(
+            image_path, output_path=out_path, engine="auto", ocr_engine=engine
+        )
+        assert supplier_key == extractor_pdf.DYNAMIC_SUPPLIER_KEY
+        assert list(formatted.columns) == STANDARD_COLUMNS
+        assert out.exists()
+
+        ws = load_workbook(out)["Invoices"]
+        header_row = exporter.HEADER_ROW
+        headers = {str(c.value): c.column_letter for c in ws[header_row]}
+        assert "EGP Converter" in headers
+        n = len(formatted)
+        first_data, last_data = header_row + 1, header_row + n
+        total_row = last_data + 1
+        conv = headers["EGP Converter"]
+        # Live per-row converter formula + SUM subtotal are intact.
+        assert str(ws[f"{conv}{first_data}"].value).startswith("=")
+        assert "$B$2" in ws[f"{conv}{first_data}"].value
+        assert ws[f"{conv}{total_row}"].value == (
+            f"=SUM({conv}{first_data}:{conv}{last_data})"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner (no pytest required)
 # ---------------------------------------------------------------------------
 def _run_all():
