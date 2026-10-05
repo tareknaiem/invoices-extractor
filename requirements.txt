@@ -1,22 +1,29 @@
+# Invoices Extractor — runtime dependencies (Streamlit Cloud / Linux + local).
+
+# --- Core application -------------------------------------------------------
 streamlit==1.64.0
 pdfplumber==0.11.10
 pandas==3.0.6
-numpy==2.5.3
-PyYAML==6.0.3
 openpyxl==3.1.5
-# Fast fuzzy column matching for the dynamic (unknown-supplier) fallback. The
-# fallback extractor degrades gracefully to the standard-library ``difflib``
-# when rapidfuzz is not installed.
+
+# numpy and PyYAML are capped by paddlex (pulled in by paddleocr): paddlex 3.7.x
+# requires "numpy<2.4,>=1.24" and exactly "PyYAML==6.0.2". Pins that disagree
+# with those caps make pip abort the whole install with a ResolutionImpossible
+# conflict — reported by Streamlit Cloud as "Error installing requirements".
+numpy==2.3.5
+PyYAML==6.0.2
+
+# Fast fuzzy column matching for the dynamic (unknown-supplier) fallback; the
+# extractor degrades gracefully to the stdlib difflib when it is absent.
 rapidfuzz==3.14.6
 
-# --- OCR (scanned / image-based PDFs) ----------------------------------------
-# PaddleOCR 3.7.0 runs on top of ``paddlex`` (pulled in automatically); CPU
-# inference additionally needs the ``paddlepaddle`` framework. PaddlePaddle
-# currently ships wheels for CPython 3.9-3.13; on newer interpreters these
-# extras are skipped and the app reports OCR as unavailable while text-based
-# PDFs keep working. PDF pages are rendered by pdfplumber's built-in backend
-# (pypdfium2), so no external poppler install is required.
-paddleocr==3.7.0; python_version < "3.14"
-paddlepaddle==3.3.1; python_version < "3.14"
-# Optional alternative page renderer (requires the poppler system binaries):
-# pdf2image==1.17.0
+# --- OCR for scanned / Arabic invoices (optional at runtime) ----------------
+# paddleocr ships a universal wheel; paddlepaddle ships manylinux wheels for
+# CPython 3.9-3.13 only (no cp314 wheels exist yet), so the interpreter that
+# runs `pip install -r requirements.txt` must be <=3.13. On Streamlit Cloud pick
+# Python 3.13 in "Advanced settings" when deploying (version files such as
+# .python-version are not honored by the platform). Without paddlepaddle the
+# app still runs and reports OCR as unavailable; PDF page
+# rendering uses pdfplumber's built-in pypdfium2 backend (no poppler needed).
+paddleocr==3.7.0
+paddlepaddle==3.3.1
