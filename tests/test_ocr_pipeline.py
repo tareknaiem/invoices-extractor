@@ -163,6 +163,56 @@ def test_render_pdf_pages_produces_rgb_arrays():
     assert array.shape[0] > 0 and array.shape[1] > 0
 
 
+def test_preprocess_for_ocr_upscales_and_stays_uint8_rgb():
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:  # pragma: no cover
+        print("      (skipped: Pillow/numpy not installed)")
+        return
+
+    # A faint grey-on-white strip (the typical dense numeric column).
+    base = np.full((60, 200, 3), 255, dtype=np.uint8)
+    base[10:50, 40:160] = 128  # low-contrast text band
+    out = extractor_ocr.preprocess_for_ocr(base, scale=3.0)
+
+    assert out.shape[0] == 180 and out.shape[1] == 600 and out.shape[2] == 3
+    assert out.dtype == np.uint8
+    # Contrast stretch pushes the grey band towards black (centre of the band,
+    # away from the interpolated edge).
+    assert int(out[90, 300, 0]) < 128
+
+
+def test_preprocess_for_ocr_noop_at_scale_one():
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover
+        print("      (skipped: numpy not installed)")
+        return
+    base = np.full((40, 40, 3), 200, dtype=np.uint8)
+    out = extractor_ocr.preprocess_for_ocr(base, scale=1.0, contrast_cutoff=0)
+    assert out.shape == (40, 40, 3)
+    assert out.dtype == np.uint8
+
+
+def test_default_upscale_factor_stays_under_paddle_limit():
+    """The default upscale must keep tall invoices under PaddleOCR's ~4000px
+    max-side limit (a 3x upscale crashed the Streamlit worker with OOM)."""
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover
+        print("      (skipped: numpy not installed)")
+        return
+
+    # A tall photographed invoice (iPhone-ish portrait), the shape that
+    # previously became 2211x4002 at 3x and blew the 4000px limit.
+    tall = np.full((1334, 737, 3), 255, dtype=np.uint8)
+    out = extractor_ocr.preprocess_for_ocr(tall)
+    assert max(out.shape[0], out.shape[1]) < 4000
+    assert out.shape[0] == int(1334 * extractor_ocr.OCR_UPSCALE_FACTOR)
+    assert extractor_ocr.OCR_UPSCALE_FACTOR <= 2.0
+
+
 # ---------------------------------------------------------------------------
 # 3. PaddleOCR result parsing (v2 and v3 shapes)
 # ---------------------------------------------------------------------------
@@ -775,6 +825,380 @@ def test_ocr_backend_cache_is_keyed_by_configuration():
         extractor_ocr.is_ocr_available = original_available
         extractor_ocr._load_paddleocr_class = original_loader
         extractor_ocr.reset_ocr_backends()
+
+
+# ---------------------------------------------------------------------------
+# 7. Strict horizontal clustering + header bands (wide borderless tables)
+# ---------------------------------------------------------------------------
+def test_strict_row_clustering_blocks_vertical_chaining():
+    """Tall boxes on a tight pitch must stay one row each.
+
+    The old global tolerance chain-merged such rows (reading whole columns
+    vertically into one concatenated cell). The strict overlap rule keeps them
+    apart.
+    """
+    lines = [OcrLine(f"r{i}", (10, 23 * i, 60, 23 * i + 40)) for i in range(6)]
+    rows = extractor_ocr.lines_to_rows(lines)
+    assert len(rows) == 6
+    assert [[line.text for line in row] for row in rows] == [[f"r{i}"] for i in range(6)]
+
+
+def test_row_clustering_keeps_same_row_boxes_together():
+    lines = [
+        OcrLine("اسم عربي طويل", (100, 40, 300, 70)),   # tall Arabic box
+        OcrLine("2", (10, 48, 50, 64)),                  # short number, same row
+        OcrLine("فندق", (100, 73, 300, 103)),            # next row
+        OcrLine("2400", (10, 81, 60, 97)),               # next row number
+    ]
+    rows = extractor_ocr.lines_to_rows(lines)
+    assert len(rows) == 2
+    assert [line.text for line in rows[0]] == ["2", "اسم عربي طويل"]
+    assert [line.text for line in rows[1]] == ["2400", "فندق"]
+
+
+def test_header_bands_split_wide_borderless_table():
+    """Columns with gutters narrower than MIN_GUTTER must not collapse."""
+    width = 1386
+    header = [OcrLine(f"H{i}", (198 * i, 10, 198 * i + 186, 34)) for i in range(7)]
+    data = [
+        OcrLine(str(100 + i), (198 * i + 60, 50, 198 * i + 120, 74))
+        for i in range(7)
+    ]
+    lines = header + data
+    # The page-wide gutter detector collapses all seven columns (12px gutters
+    # < 1.2% of the page) — exactly the bug the header bands fix.
+    assert len(extractor_ocr.column_bands(lines, width)) == 1
+    table = extractor_ocr.lines_to_table(lines, page_width=width)
+    assert len(table) == 2
+    assert table[0] == [f"H{i}" for i in range(7)]
+    assert table[1] == [str(100 + i) for i in range(7)]
+
+
+def test_closely_stacked_numbers_are_not_merged_vertically():
+    """Closely-stacked numbers must each become their own row.
+
+    Regression: the Hero "Total Invoice" values ("888-", "681-", "1,493-", ...)
+    were read vertically into one concatenated cell. Even when the OCR boxes
+    overlap vertically, distinct y-centres must stay in distinct rows.
+    """
+    lines = [
+        OcrLine("888-", (10, 100, 60, 122)),
+        OcrLine("681-", (10, 116, 60, 138)),
+        OcrLine("1,493-", (10, 132, 60, 154)),
+        OcrLine("0", (10, 148, 60, 170)),
+    ]
+    rows = extractor_ocr.lines_to_rows(lines)
+    assert len(rows) == 4
+    assert [[line.text for line in row] for row in rows] == [
+        ["888-"], ["681-"], ["1,493-"], ["0"],
+    ]
+
+
+def test_row_clustering_ignores_tall_arabic_boxes():
+    """A tall Arabic cell must not drag two adjacent rows together.
+
+    The old median-anchor overlap rule let a tall Arabic box widen the row's
+    anchor box so the next row's numbers overlapped it and merged. The
+    centre-gap clustering keeps the two lines apart regardless of box height.
+    """
+    lines = [
+        OcrLine("888-", (10, 100, 60, 114)),
+        OcrLine("فندق", (200, 90, 320, 130)),
+        OcrLine("شرم", (340, 90, 420, 130)),
+        OcrLine("الغردقة", (440, 90, 560, 130)),
+        OcrLine("681-", (10, 118, 60, 132)),
+        OcrLine("هيلتون", (200, 108, 320, 148)),
+        OcrLine("سيناء", (340, 108, 420, 148)),
+        OcrLine("الرحلة", (440, 108, 560, 148)),
+    ]
+    rows = extractor_ocr.lines_to_rows(lines)
+    assert len(rows) == 2
+    assert [line.text for line in rows[0]] == ["888-", "فندق", "شرم", "الغردقة"]
+    assert [line.text for line in rows[1]] == ["681-", "هيلتون", "سيناء", "الرحلة"]
+
+
+def test_stacked_numbers_reconstruct_to_separate_table_rows():
+    """A vertical run of numbers in one column must yield one grid row each."""
+    lines = [
+        OcrLine("Notes", (20, 40, 120, 62)),
+        OcrLine("888-", (20, 100, 120, 122)),
+        OcrLine("681-", (20, 120, 120, 142)),
+        OcrLine("1,493-", (20, 140, 120, 162)),
+        OcrLine("0", (20, 160, 120, 182)),
+    ]
+    table = extractor_ocr.lines_to_table(lines, page_width=400)
+    assert len(table) == 5
+    assert [row[0] for row in table] == ["Notes", "888-", "681-", "1,493-", "0"]
+
+
+# ---------------------------------------------------------------------------
+# 8b. Coordinate-template reconstruction (known suppliers)
+# ---------------------------------------------------------------------------
+def test_template_splits_wide_box_across_columns():
+    """A box straddling several columns is sliced at the column boundaries."""
+    width = 600
+    lines = [
+        OcrLine("A", (0, 10, 140, 30)),
+        OcrLine("B", (150, 10, 290, 30)),
+        OcrLine("C", (300, 10, 440, 30)),
+        OcrLine("D", (450, 10, 590, 30)),
+        OcrLine("22 33", (150, 50, 440, 70)),  # spans columns B and C
+    ]
+    table = extractor_ocr.template_lines_to_table(lines, width, ["A", "B", "C", "D"])
+    assert table is not None
+    assert table[0] == ["A", "B", "C", "D"]
+    assert table[1][1] == "22"   # B column
+    assert table[1][2] == "33"   # C column
+
+
+def test_template_splits_multiline_box_into_rows():
+    """A multi-line OCR box (newline-separated) is split into its rows."""
+    width = 600
+    lines = [
+        OcrLine("A", (0, 10, 200, 30)),
+        OcrLine("B", (300, 10, 500, 30)),
+        OcrLine("x\ny\nz", (0, 50, 200, 110)),  # three lines in one tall box
+    ]
+    table = extractor_ocr.template_lines_to_table(lines, width, ["A", "B"])
+    assert table is not None
+    assert table[0] == ["A", "B"]
+    assert [row[0] for row in table[1:]] == ["x", "y", "z"]
+
+
+def test_template_bypasses_generic_row_clustering():
+    """A known supplier's header anchors columns even when rows overlap."""
+    width = 600
+    header_names = ["Date", "Hotel", "Total"]
+    lines = [
+        OcrLine("Date", (0, 10, 190, 30)),
+        OcrLine("Hotel", (200, 10, 390, 30)),
+        OcrLine("Total", (400, 10, 590, 30)),
+        # Two data rows whose boxes overlap vertically (generic clustering
+        # would merge them) but which sit in distinct columns.
+        OcrLine("1-Sep", (0, 50, 190, 90)),
+        OcrLine("Hilton", (200, 60, 390, 100)),
+        OcrLine("100", (400, 70, 590, 110)),
+        OcrLine("2-Sep", (0, 80, 190, 120)),
+        OcrLine("Cairo", (200, 90, 390, 130)),
+        OcrLine("200", (400, 100, 590, 140)),
+    ]
+    table = extractor_ocr.template_lines_to_table(lines, width, header_names)
+    assert table is not None
+    assert table[0] == ["Date", "Hotel", "Total"]
+    # Two rows, each with all three cells populated (no vertical concat).
+    assert len(table) == 3
+    assert table[1] == ["1-Sep", "Hilton", "100"]
+    assert table[2] == ["2-Sep", "Cairo", "200"]
+
+
+def test_split_discrete_numeric_values():
+    """Discrete values separated by spaces or dashes are split; dates/text are preserved."""
+    split = extractor_ocr._split_discrete_numeric_values
+    assert split("888- 681- 1,493- 991-") == ["888-", "681-", "1,493-", "991-"]
+    assert split("888 681 1,493 991") == ["888", "681", "1,493", "991"]
+    assert split("888-681-1,493-991-") == ["888-", "681-", "1,493-", "991-"]
+    assert split("888-681-1493-991") == ["888", "681", "1493", "991"]
+    assert split("888 - 681 - 1,493 - 991") == ["888", "681", "1,493", "991"]
+    assert split("-888 -681 -1,493") == ["-888", "-681", "-1,493"]
+    assert split("100.50 200.75 300.00") == ["100.50", "200.75", "300.00"]
+    assert split("888-") == ["888-"]
+    assert split("2026-09-10") == ["2026-09-10"]
+    assert split("10/09/2026") == ["10/09/2026"]
+    assert split("Hilton - Room 101") == ["Hilton - Room 101"]
+    assert split("2609131157") == ["2609131157"]
+
+
+def test_template_splits_unnewline_numeric_box_into_rows():
+    """A bounding box in a numeric column lacking newlines is force-split into separate rows."""
+    width = 800
+    header_names = ["Date", "Hotel", "Total", "Net"]
+    lines = [
+        OcrLine("Date", (0, 10, 190, 30)),
+        OcrLine("Hotel", (200, 10, 390, 30)),
+        OcrLine("Total", (400, 10, 590, 30)),
+        OcrLine("Net", (600, 10, 790, 30)),
+        # 4 distinct Date boxes
+        OcrLine("1-Sep", (0, 50, 190, 80)),
+        OcrLine("2-Sep", (0, 90, 190, 120)),
+        OcrLine("3-Sep", (0, 130, 190, 160)),
+        OcrLine("4-Sep", (0, 170, 190, 200)),
+        # 4 distinct Hotel boxes
+        OcrLine("Hilton", (200, 50, 390, 80)),
+        OcrLine("Cairo", (200, 90, 390, 120)),
+        OcrLine("Rixos", (200, 130, 390, 160)),
+        OcrLine("Savoy", (200, 170, 390, 200)),
+        # Single box for Total lacking newlines (e.g. 888- 681- 1,493- 991-)
+        OcrLine("888- 681- 1,493- 991-", (400, 50, 590, 200)),
+        # Single box for Net lacking newlines
+        OcrLine("888- 681- 1,493- 991-", (600, 50, 790, 200)),
+    ]
+    table = extractor_ocr.template_lines_to_table(lines, width, header_names)
+    assert table is not None
+    assert table[0] == ["Date", "Hotel", "Total", "Net"]
+    assert len(table) == 5
+    assert table[1] == ["1-Sep", "Hilton", "888-", "888-"]
+    assert table[2] == ["2-Sep", "Cairo", "681-", "681-"]
+    assert table[3] == ["3-Sep", "Rixos", "1,493-", "1,493-"]
+    assert table[4] == ["4-Sep", "Savoy", "991-", "991-"]
+
+
+def test_generic_lines_to_table_splits_unnewline_numeric_box():
+    """Generic lines_to_table fallback expands unnewline discrete numeric boxes."""
+    lines = [
+        OcrLine("Date", (0, 10, 190, 30)),
+        OcrLine("Hotel", (200, 10, 390, 30)),
+        OcrLine("Total", (400, 10, 590, 30)),
+        OcrLine("1-Sep", (0, 50, 190, 80)),
+        OcrLine("2-Sep", (0, 90, 190, 120)),
+        OcrLine("Hilton", (200, 50, 390, 80)),
+        OcrLine("Cairo", (200, 90, 390, 120)),
+        OcrLine("888- 681-", (400, 50, 590, 120)),
+    ]
+    table = extractor_ocr.lines_to_table(lines, 600)
+    assert len(table) == 3
+    assert table[0] == ["Date", "Hotel", "Total"]
+    assert table[1] == ["1-Sep", "Hilton", "888-"]
+    assert table[2] == ["2-Sep", "Cairo", "681-"]
+
+
+# ---------------------------------------------------------------------------
+# 8. Hero end-to-end via the OCR pipeline
+# ---------------------------------------------------------------------------
+HERO_OCR_HEADERS = [
+    "Total Invoice", "Total REST", "Rest£", "Rest€", "Rest$", "Rest Egy",
+    "Total", "Eng$", "Euro", "Dollar", "Egy LE", "Dive2", "Dive1",
+    "intro2", "intro1", "Nationality", "Notes / Details", "Room/Tel",
+    "Infant", "Child", "Adults", "Hotel", "Trip", "Date",
+]
+
+
+def _hero_ocr_lines(width=1440):
+    """Reconstructed Hero OCR output: metadata strip + header + 2 data rows."""
+    pitch = width // len(HERO_OCR_HEADERS)
+    lines = []
+
+    def add(text, x, y, w, h):
+        lines.append(OcrLine(text, (x, y, x + w, y + h)))
+
+    meta_labels = ["TOTAL", "RECORDS", "PERIOD", "RECIPIENT", "INVOICE DATE", "INVOICE NO"]
+    meta_values = ["-10,353 LE", "27 items", "2026-09-10 → 2026-09-13",
+                   "Ayman Sharm Gate", "Sep 13, 2026", "2609131157"]
+    for i, lab in enumerate(meta_labels):
+        add(lab, 20 + i * 120, 10, 100, 20)
+    for i, val in enumerate(meta_values):
+        add(val, 20 + i * 120, 40, 110, 20)
+
+    for i, head in enumerate(HERO_OCR_HEADERS):
+        add(head, i * pitch + 4, 90, pitch - 8, 22)
+
+    row1 = ["915-", "3315", "", "56", "", "2400", "2600", "", "", "3600", "2400",
+            "", "", "", "", "ايطاليا", "TG2026-5315", "393895769302+", "0", "1",
+            "2", "فندق نعمه ساتر", "الرحلة الرئيسية", "2026-09-10"]
+    row2 = ["980-", "4080", "", "", "1495", "5400", "3100", "", "122", "", "3100",
+            "", "", "", "", "المانيا", "TG2026-6474", "31692313415+", "1", "0",
+            "4", "فرشاز هيلتون", "رحلة غطس", "2026-09-11"]
+    for y, row in ((130, row1), (170, row2)):
+        for i, val in enumerate(row):
+            if val:
+                add(val, i * pitch + 6, y, pitch - 12, 22)
+
+    # Footer conversion labels (also used for supplier auto-detection).
+    add("T-InEgy", 20, 300, 80, 20)
+    add("T-InEng", 120, 300, 80, 20)
+    add("T-InEuro", 220, 300, 90, 20)
+    return lines
+
+
+def test_hero_profile_applied_via_ocr_pipeline():
+    pdf = _first_pdf()
+    if pdf is None:
+        print("      (skipped: no sample PDF in the workspace)")
+        return
+    engine = _FakeEngine(_hero_ocr_lines())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = Path(tmp) / "hero_out.xlsx"
+        out, formatted, summary, supplier_key = main.run(
+            pdf, output_path=out_path, engine="ocr", ocr_engine=engine,
+            ocr_resolution=72, ocr_max_pages=1,
+        )
+
+        # The wide borderless layout was recognised and mapped via its profile.
+        assert supplier_key == "hero"
+        assert list(formatted.columns) == STANDARD_COLUMNS
+        assert len(formatted) == 2
+        assert list(formatted["V.NO"]) == ["TG2026-5315", "TG2026-6474"]
+        assert formatted["Net"].iloc[0] == -915
+        assert formatted["EGP"].iloc[0] == 2400
+        assert formatted["USD"].iloc[0] == 3600
+
+        # The invoice number (metadata strip above the header) is never a
+        # money value or a data cell.
+        assert formatted["EGP Converter"].isna().all()
+        assert not (formatted.astype(str) == "2609131157").any().any()
+
+        # The live EGP converter formula survives the OCR path.
+        ws = load_workbook(out)["Invoices"]
+        headers = {str(c.value): c.column_letter for c in ws[exporter.HEADER_ROW]}
+        assert "EGP Converter" in headers
+        conv = headers["EGP Converter"]
+        assert str(ws[f"{conv}{exporter.HEADER_ROW + 1}"].value).startswith("=")
+
+
+def test_hero_profile_forced_via_manual_override():
+    """Manual supplier_key='hero' forces the Hero profile even when identifiers are absent."""
+    pdf = _first_pdf()
+    if pdf is None:
+        print("      (skipped: no sample PDF in the workspace)")
+        return
+
+    # Lines without any Hero identifiers (no 'Hero', 'Ayman', 'T-InEgy')
+    lines = [ln for ln in _hero_ocr_lines() if not any(
+        ident in ln.text for ident in ("Ayman", "Hero", "T-InEgy", "T-InEng", "T-InEuro")
+    )]
+    # Auto-detection from this text returns None
+    assert formatter.detect_supplier("\n".join(ln.text for ln in lines), formatter.load_rules()) is None
+
+    engine = _FakeEngine(lines)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = Path(tmp) / "hero_forced.xlsx"
+        out, formatted, summary, supplier_key = main.run(
+            pdf, supplier_key="hero", output_path=out_path, engine="ocr",
+            ocr_engine=engine, ocr_resolution=72, ocr_max_pages=1,
+        )
+
+        # Forced profile used the 24-column Hero template and mapped to standard columns.
+        assert supplier_key == "hero"
+        assert list(formatted.columns) == STANDARD_COLUMNS
+        assert len(formatted) == 2
+        assert list(formatted["V.NO"]) == ["TG2026-5315", "TG2026-6474"]
+        assert formatted["Net"].iloc[0] == -915
+        assert formatted["EGP"].iloc[0] == 2400
+        assert formatted["USD"].iloc[0] == 3600
+
+
+def test_find_header_row_fuzzy_matches_noisy_1x_headers():
+    """_find_header_row matches headers when text is noisy or partial from 1x OCR."""
+    header_names = ["Date", "Hotel", "Total", "Adults", "Euro", "Dollar", "Notes / Details"]
+    lines = [
+        # Slightly noisy or truncated 1x OCR boxes
+        OcrLine("Dat", (10, 50, 80, 70)),
+        OcrLine("Hotl", (100, 50, 180, 70)),
+        OcrLine("Totl", (200, 50, 270, 70)),
+        OcrLine("Adult", (290, 50, 360, 70)),
+        OcrLine("Eur", (380, 50, 440, 70)),
+        OcrLine("Dolar", (460, 50, 530, 70)),
+        OcrLine("Notes", (550, 50, 640, 70)),  # token match of "Notes / Details"
+        # Data row below
+        OcrLine("1-Sep", (10, 100, 80, 120)),
+        OcrLine("Hilton", (100, 100, 180, 120)),
+        OcrLine("100", (200, 100, 270, 120)),
+    ]
+    matched = extractor_ocr._find_header_row(lines, header_names)
+    assert len(matched) == 7
+    texts = {ln.text for ln in matched}
+    assert texts == {"Dat", "Hotl", "Totl", "Adult", "Eur", "Dolar", "Notes"}
 
 
 # ---------------------------------------------------------------------------

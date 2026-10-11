@@ -41,13 +41,17 @@ _ARABIC_RE = re.compile(
 )
 
 # Currency codes and symbols to strip from monetary values.
-_CURRENCY_CODE_RE = re.compile(r"\b(EGP|USD|EUR|EURO|GBP|POUNDS?)\b", re.IGNORECASE)
+_CURRENCY_CODE_RE = re.compile(
+    r"\b(EGP|USD|EUR|EURO|GBP|POUNDS?|L\.?E)\b", re.IGNORECASE
+)
 _CURRENCY_SYMBOL_RE = re.compile(r"[$€£¥]")
 
 # Column-name keywords that indicate a monetary column.
 _CURRENCY_COLUMN_KEYWORDS = (
     "usd", "egp", "eur", "eue", "euro", "gbp", "pound",
     "collect", "cost", "net", "total", "amount", "price",
+    # Header spellings used by some suppliers ("Dollar", "Egy LE", "cash L.E").
+    "dollar", "egy le", "cash",
 )
 
 # Labels that mark a summary/total block rather than a transaction row.
@@ -74,6 +78,23 @@ _SUMMARY_WORDS = {
     "اجمالي", "إجمالي", "الإجمالي", "الاجمالي", "صافي", "الصافي",
     "المجموع", "مجموع", "الباقي",
 }
+
+# Labels that head the invoice-metadata strip above the main table
+# ("INVOICE NO", "INVOICE DATE", "invoice number", ...). "Total Invoice" (a
+# data-table column) must NOT match: the ``no/num/number/date`` suffix is
+# mandatory, so bare "invoice" never triggers this.
+_INVOICE_LABEL_RE = re.compile(
+    r"\binvoice\s*(?:no|num|number|date)\b\.?", re.IGNORECASE
+)
+
+# A bare identifier 10+ digits long (invoice/booking numbers like 2609131157)
+# that must never be coerced into a money value.
+_BARE_ID_RE = re.compile(r"\d{10,}")
+
+# The metadata strip is a small table (TOTAL / RECORDS / PERIOD / RECIPIENT /
+# INVOICE DATE / INVOICE NO = 6 columns). A table wider than this cannot be the
+# metadata strip, even if its first row carries an invoice label.
+INVOICE_META_MAX_COLS = 10
 
 # Unmapped-glyph markers emitted when a PDF font lacks a ``ToUnicode`` map,
 # e.g. ``(cid:123)``. They carry no readable text, so they are stripped and used
@@ -122,14 +143,24 @@ def _clean_currency(value):
         "EGP 4,600"    -> 4600
         "€ 310"        -> 310
         "( 23,756.00)" -> -23756.0
+        "915-"         -> -915          (trailing-minus negative)
+        "2609131157"   -> "2609131157"  (bare 10+ digit identifier -> text)
 
-    Non-numeric text is returned unchanged (whitespace-normalized).
+    Bare identifiers 10+ digits long (invoice/booking numbers) are returned
+    unchanged as text so they can never surface as a huge amount (e.g.
+    ``2,609,131,157.00``) inside a currency column. Non-numeric text is
+    returned unchanged (whitespace-normalized).
     """
     if value is None or pd.isna(value):
         return ""
     text = str(value).strip()
-    if not text:
+    if not text or text in ("-", "--", "—"):
         return ""
+
+    original = text
+    had_currency_context = bool(
+        _CURRENCY_CODE_RE.search(original) or _CURRENCY_SYMBOL_RE.search(original)
+    )
 
     # Accounting-style parentheses denote a negative amount.
     negative = text.startswith("(") and text.endswith(")")
@@ -144,9 +175,26 @@ def _clean_currency(value):
     # If what remains is a plain number (internal spaces allowed, e.g. "$ 7 5"),
     # collapse the spaces and return a numeric value.
     candidate = re.sub(r"\s+", "", text)
-    if re.fullmatch(r"\d+(\.\d+)?", candidate):
+
+    # Trailing minus ("915-") is another negative convention.
+    trailing_minus = candidate.endswith("-") and len(candidate) > 1
+    if trailing_minus:
+        candidate = candidate[:-1]
+
+    if re.fullmatch(r"-?\d+(\.\d+)?", candidate):
         number = float(candidate) if "." in candidate else int(candidate)
-        return -number if negative else number
+        if (
+            not had_currency_context
+            and isinstance(number, int)
+            and abs(number) >= 10**9
+        ):
+            # A bare invoice/booking number masquerading as an amount.
+            return " ".join(original.split())
+        if trailing_minus:
+            number = -abs(number)
+        if negative:
+            number = -abs(number)
+        return number
 
     return " ".join(text.split())
 
@@ -328,6 +376,57 @@ def _parse_summary_table(table):
     return summary
 
 
+def _invoice_label_row(row):
+    """Return True when ``row`` heads the invoice-metadata label strip.
+
+    The strip labels the page (TOTAL / RECORDS / PERIOD / RECIPIENT /
+    INVOICE DATE / INVOICE NO). At least two cells must look like an
+    ``INVOICE ...`` label so a single data column named "Invoice No" never
+    triggers this.
+    """
+    if not row:
+        return False
+    matches = sum(
+        1 for cell in row if _INVOICE_LABEL_RE.search(_clean_cell(cell))
+    )
+    return matches >= 2
+
+
+def _split_invoice_meta(table, summary):
+    """Pull the invoice-metadata strip out of ``table`` into ``summary``.
+
+    The strip is the label row plus the value row directly beneath it. Its
+    values — most importantly the invoice number — are page metadata and must
+    never leak into the transaction table (where the invoice number would
+    otherwise surface as a huge amount in a currency column). Returns the
+    table with both rows removed.
+    """
+    if not table:
+        return table
+
+    label_indices = set(i for i, row in enumerate(table) if _invoice_label_row(row))
+    if not label_indices:
+        return table
+
+    kept = []
+    for i, row in enumerate(table):
+        if i in label_indices:
+            value_row = table[i + 1] if i + 1 < len(table) else []
+            for j, cell in enumerate(row):
+                label = _clean_cell(cell)
+                if not label:
+                    continue
+                value = _clean_cell(value_row[j]) if j < len(value_row) else ""
+                if value:
+                    summary.setdefault(label, _clean_currency(value))
+            continue
+        if i - 1 in label_indices:
+            # The value row directly beneath a label row is metadata too.
+            continue
+        kept.append(row)
+    return kept
+
+
 def _drop_summary_rows(frame, min_filled=5, arabic_labels_are_summary=True):
     """Remove repeated-header, total/subtotal and summary rows from a frame.
 
@@ -373,6 +472,9 @@ def _drop_summary_rows(frame, min_filled=5, arabic_labels_are_summary=True):
                 continue
             non_empty += 1
             if _SUMMARY_CELL_RE.search(text) or _SUMMARY_ROW_RE.search(text):
+                return True
+            # A row carrying an "INVOICE NO / DATE" label is metadata, not data.
+            if _INVOICE_LABEL_RE.search(text):
                 return True
         first_value = row[first_col]
         first_text = str(first_value).strip() if first_value is not None else ""
@@ -475,6 +577,13 @@ def extract_tables_from_pdf(pdf_path):
     summary = {}
 
     for table in tables:
+        # The invoice-metadata strip (INVOICE NO / INVOICE DATE / ...) is page
+        # metadata, not transaction data: split it out first so the invoice
+        # number can never become a table value.
+        table = _split_invoice_meta(table, summary)
+        if not table:
+            continue
+
         if _is_summary_table(table):
             summary.update(_parse_summary_table(table))
             continue
@@ -517,6 +626,13 @@ def tables_to_transactions(tables, fix_arabic=True):
     summary = {}
 
     for table in tables:
+        # The invoice-metadata strip (INVOICE NO / INVOICE DATE / ...) is page
+        # metadata, not transaction data: split it out first so the invoice
+        # number can never become a table value.
+        table = _split_invoice_meta(table, summary)
+        if not table:
+            continue
+
         if _is_summary_table(table):
             summary.update(_parse_summary_table(table))
             continue

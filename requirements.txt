@@ -1,75 +1,8 @@
-# Invoices Extractor — runtime dependencies (Streamlit Cloud / Linux + local).
-#
-# Install policy — prebuilt CPU wheels, fast on Linux deploy boxes:
-#   * the official PaddlePaddle CPU wheel index is added as an extra source
-#     (PyPI stays active) so paddlepaddle downloads from Paddle's CDN;
-#   * paddlepaddle is wheel-only — it ships ~193MB prebuilt CPU wheels and has
-#     no source distribution; a source build or a stalled oversized download
-#     times out the Streamlit Cloud build;
-#   * prefer wheel-backed versions for every dependency.
-#
-# Keeping the venv in sync: a stale paddlepaddle survives `pip install -r`
-# runs that do not name it explicitly, and a 2.x leftover is exactly what
-# breaks protobuf. After changing anything here run:
-#     pip install -r requirements.txt
-#     pip check          # must print "No broken requirements found."
-#     python -c "import extractor_ocr as e; print(e.is_ocr_available())"
---extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
---only-binary paddlepaddle
---prefer-binary
+# Invoices Extractor - runtime dependencies.
+# Install with:  pip install -r requirements.txt
 
-# --- Core application -------------------------------------------------------
-streamlit==1.64.0
-pdfplumber==0.11.10
-pandas==3.0.6
-openpyxl==3.1.5
-
-# numpy and PyYAML are capped by paddlex (pulled in by paddleocr): paddlex 3.7.x
-# requires "numpy<2.4,>=1.24" and exactly "PyYAML==6.0.2". Pins that disagree
-# with those caps make pip abort the whole install with a ResolutionImpossible
-# conflict — reported by Streamlit Cloud as "Error installing requirements".
-numpy==2.3.5
-PyYAML==6.0.2
-
-# Fast fuzzy column matching for the dynamic (unknown-supplier) fallback; the
-# extractor degrades gracefully to the stdlib difflib when it is absent.
-rapidfuzz==3.14.6
-
-# --- OCR for scanned / Arabic invoices (optional at runtime) ----------------
-# paddleocr ships a universal wheel. paddlepaddle ships ~193MB prebuilt CPU
-# wheels only (no sdist) for CPython 3.9-3.13 — no cp314 wheels exist on any
-# index yet, so the deploy interpreter must be <=3.13: on Streamlit Cloud pick
-# Python 3.13 in "Advanced settings" (version files such as .python-version
-# are not honored by the platform). The >=3.3.1,<4 range makes pip take the
-# current CPU wheels from the official index above (3.4.x on Linux/Windows)
-# while older platforms fall back to 3.3.1 on PyPI. Without paddlepaddle the
-# app still runs and reports OCR as unavailable; PDF page rendering uses
-# pdfplumber's built-in pypdfium2 backend (no poppler needed).
-#
-# The 3.x floor is also what keeps the protobuf graph resolvable. The legacy
-# 2.x line is NOT compatible with this stack: paddlepaddle 2.6.2 declares
-# `protobuf>=3.1.0,<=3.20.2` on Windows, which is unsatisfiable next to
-# streamlit's `protobuf>=5.26.1,<8` — pip aborts the whole install with
-# ResolutionImpossible. Worse, if protobuf 5+/7+ is installed anyway (as it is
-# by default today), `import paddle` raises "TypeError: Descriptors cannot be
-# created directly" because 2.6.2 ships pre-protobuf-4 generated _pb2.py
-# files, and OCR silently reports as unavailable. Never relax this below 3.x.
-#
-# Transitive OCR deps resolve from these pins on Linux (verified wheel-only for
-# cp313): paddlex[ocr-core] pulls opencv-contrib-python==4.10.0.84 (cp37-abi3),
-# pyclipper, shapely, python-bidi — all present in the resolved graph. lmdb and
-# opencv-python-headless are NOT part of the PaddleOCR 3.x stack, so they are
-# deliberately not listed. System shared libraries (libGL for cv2, libgomp for
-# Paddle) are not pip packages: see packages.txt.
-paddleocr==3.7.0
-paddlepaddle>=3.3.1,<4
-
-# protobuf is the one shared transitive dependency of streamlit and
-# paddlepaddle, so it is pinned explicitly instead of left to the resolver.
-# It is the intersection of their two constraints and must not be widened:
-#   streamlit 1.64.0  ->  protobuf>=5.26.1,<8
-#   paddlepaddle 3.x  ->  protobuf>=3.20.2   (no upper bound)
-#   => protobuf>=5.26.1,<8   (protobuf 7.36.2 verified working on cp311)
-# The lower bound comes from Streamlit, the upper bound caps the protobuf major
-# so a future 8.x release cannot silently break Streamlit on deploy.
-protobuf>=5.26.1,<8
+openai
+python-dotenv
+pandas
+openpyxl
+streamlit

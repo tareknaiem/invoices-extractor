@@ -231,7 +231,8 @@ def _build_notes(df, notes_columns):
             label = notes_columns.get(header, header)
             value = row.get(header)
             text = "" if value is None else str(value).strip()
-            if text:
+            # A lone dash ("-") is the invoice's placeholder for an empty cell.
+            if text and text not in ("-", "--", "—"):
                 parts.append(f"{label}: {text}" if label else text)
         return " | ".join(parts)
 
@@ -330,7 +331,9 @@ _TOTAL_KEYWORD_RE = re.compile(
 )
 
 # Ordered so "Egyptian Pounds" resolves to EGP before the generic GBP rule.
+# "Eng$" (sterling) is checked first so it wins over the bare-"$" USD rule.
 _CURRENCY_HEADER_PATTERNS = (
+    ("GBP", re.compile(r"eng\s*\$", re.IGNORECASE)),
     ("USD", re.compile(r"\$|us\$|\busd\b|\bdollars?\b", re.IGNORECASE)),
     ("Euros", re.compile(r"€|\beur\b|\beuros?\b|\beue\b", re.IGNORECASE)),
     (
@@ -418,6 +421,106 @@ def build_column_mapping(headers, standard_columns=None, rules=None,
     return mapping
 
 
+# Minimum similarity for a profile/notes key to resolve against a frame column
+# whose spelling drifted (OCR noise, e.g. "Notes/Details" vs "Notes / Details").
+PROFILE_HEADER_MATCH_THRESHOLD = 0.85
+# Minimum fraction of a profile's ``columns_mapping`` keys that must resolve
+# onto a frame's headers before the profile is trusted over the dynamic mapper.
+PROFILE_MIN_HEADER_RATIO = 0.6
+
+
+def _resolve_column(key, columns, taken=()):
+    """Resolve a profile header key to an actual DataFrame column.
+
+    Exact matches win; otherwise the closest column whose normalized header is
+    within :data:`PROFILE_HEADER_MATCH_THRESHOLD` similarity is returned. This
+    lets a curated ``columns_mapping`` still apply when OCR slightly corrupts a
+    header. Columns already claimed (``taken``) are never reused.
+
+    Args:
+        key (str): The profile/mapping header name.
+        columns (list): The frame's column names.
+        taken (set): Column names already assigned elsewhere.
+
+    Returns:
+        str or None: The matched column name, or ``None`` when nothing is close.
+    """
+    if not key:
+        return None
+    if key in columns and key not in taken:
+        return key
+
+    normalized = _normalize_header(key)
+    if not normalized:
+        return None
+
+    best, best_score = None, 0.0
+    for col in columns:
+        if col in taken:
+            continue
+        score = _similarity(normalized, _normalize_header(col))
+        if score > best_score:
+            best, best_score = col, score
+    return best if best_score >= PROFILE_HEADER_MATCH_THRESHOLD else None
+
+
+def frame_matches_profile(df, supplier_key, rules=None,
+                          min_ratio=PROFILE_MIN_HEADER_RATIO):
+    """Return True when a frame's headers sufficiently match a profile.
+
+    Used by the OCR pipeline: recognised header text is noisy, so a curated
+    profile is only trusted when at least ``min_ratio`` of its
+    ``columns_mapping`` keys resolve onto the frame (via
+    :func:`_resolve_column`). Falls back to the dynamic mapper otherwise.
+
+    Args:
+        df (pd.DataFrame): The raw (unmapped) transactions frame.
+        supplier_key (str): Supplier profile key to test.
+        rules (dict, optional): Parsed rules; loaded from YAML when omitted.
+        min_ratio (float): Minimum resolved-key ratio to accept the profile.
+
+    Returns:
+        bool: True when the profile applies to ``df``.
+    """
+    if rules is None:
+        rules = load_rules()
+    supplier = rules.get("suppliers", {}).get(supplier_key)
+    if not supplier or df is None or len(df.columns) == 0:
+        return False
+
+    mapping = supplier.get("columns_mapping") or {}
+    if not mapping:
+        return False
+
+    columns = list(df.columns)
+    taken = set()
+    hits = 0
+    for key in mapping:
+        col = _resolve_column(key, columns, taken)
+        if col is not None:
+            hits += 1
+            taken.add(col)
+    return hits / len(mapping) >= min_ratio
+
+
+def profile_header_names(supplier_key, rules=None):
+    """Return the expected header labels of a supplier profile.
+
+    These are the ``columns_mapping`` and ``notes_columns`` keys — the header
+    strings the OCR must match in order to anchor the supplier's column
+    template (see :func:`extractor_ocr.template_lines_to_table`). Order is not
+    significant: the template sorts the matched boxes by X-coordinate.
+    """
+    if rules is None:
+        rules = load_rules()
+    supplier = rules.get("suppliers", {}).get(supplier_key)
+    if not supplier:
+        return []
+    names = list(supplier.get("columns_mapping") or {})
+    names += list(supplier.get("notes_columns") or {})
+    return names
+
+
 def format_with_mapping(df, standard_columns, mapping, notes_columns=None):
     """Build a standard-schema DataFrame from an explicit column mapping.
 
@@ -445,20 +548,34 @@ def format_with_mapping(df, standard_columns, mapping, notes_columns=None):
     standard_columns = list(standard_columns)
     formatted = pd.DataFrame(index=range(len(df)))
 
+    # Resolve every mapping / notes key onto an actual DataFrame column:
+    # exact match first, then a thresholded fuzzy match so a curated profile
+    # still applies when OCR slightly corrupts a header. Each column is
+    # claimed at most once.
+    columns = list(df.columns)
+    taken = set()
+    sources = {}  # standard_column -> DataFrame column
+    for key, target in mapping.items():
+        col = _resolve_column(key, columns, taken)
+        if col is None:
+            continue
+        taken.add(col)
+        sources.setdefault(target, col)
+
+    resolved_notes = {}  # DataFrame column -> label
+    for key, label in notes_columns.items():
+        col = _resolve_column(key, columns, taken)
+        if col is None:
+            continue
+        taken.add(col)
+        resolved_notes[col] = label
+
     for standard_col in standard_columns:
         if standard_col == "Notes":
-            formatted[standard_col] = _build_notes(df, notes_columns)
+            formatted[standard_col] = _build_notes(df, resolved_notes)
             continue
 
-        source = next(
-            (
-                header
-                for header, target in mapping.items()
-                if target == standard_col and header in df.columns
-            ),
-            None,
-        )
-
+        source = sources.get(standard_col)
         if source is not None:
             formatted[standard_col] = df[source].reset_index(drop=True)
         else:

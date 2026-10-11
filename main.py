@@ -28,8 +28,11 @@ Profiles win when they match because the curated mappings recover columns the
 fuzzy matcher misses (measured on the sample invoices: 59 vs 50 populated
 ``Total`` values, and ``V.NO`` 28 vs 0 on ``egypt_gate``).
 
-OCR/image inputs keep using :func:`formatter.format_dynamic`: recognised header
-text is noisy, so a curated profile would mis-map it.
+OCR/image inputs may also use a profile: recognised header text is noisy, so
+the profile is only applied when it both identifies itself and its
+``columns_mapping`` substantially covers the recognised frame
+(:func:`formatter.frame_matches_profile`); otherwise the fuzzy dynamic mapper
+is used.
 """
 
 from __future__ import annotations
@@ -156,9 +159,10 @@ def run(pdf_path, supplier_key=None, output_path=None, engine="auto",
     if is_image or _resolve_engine(engine, pdf_path):
         # OCR pipeline (scanned / image PDFs, forced via engine="ocr", or a
         # direct image upload - jpg/jpeg/png always OCR regardless of engine).
+        target_supplier = supplier_key if supplier_key in suppliers else None
         if is_image:
             raw, summary, ocr_text = extractor_ocr.extract_transactions_from_image(
-                pdf_path, engine=ocr_engine
+                pdf_path, engine=ocr_engine, rules=rules, supplier=target_supplier
             )
         else:
             ocr_kwargs = {}
@@ -168,11 +172,26 @@ def run(pdf_path, supplier_key=None, output_path=None, engine="auto",
                 ocr_kwargs["max_pages"] = ocr_max_pages
 
             raw, summary, ocr_text = extractor_ocr.extract_transactions_from_pdf(
-                pdf_path, rules=rules, engine=ocr_engine, **ocr_kwargs
+                pdf_path, rules=rules, engine=ocr_engine, supplier=target_supplier, **ocr_kwargs
             )
-        # OCR header text is noisy, so always use the fuzzy dynamic mapper.
-        formatted = formatter.format_dynamic(raw, standard_columns=standard_columns)
-        supplier_key = extractor_pdf.DYNAMIC_SUPPLIER_KEY
+
+        # If a supplier profile was explicitly chosen, use its curated mapping.
+        if target_supplier is not None:
+            formatted = formatter.format_transactions(raw, target_supplier, rules)
+            supplier_key = target_supplier
+        else:
+            # Auto-detect: OCR header text is noisy, so the fuzzy dynamic mapper is default.
+            # A curated profile is trusted only when the recognised text actually
+            # identifies a supplier AND that profile's columns_mapping covers the
+            # recognised headers (see formatter.frame_matches_profile). Otherwise
+            # the dynamic mapper (which also folds extra columns into Notes) is used.
+            ocr_supplier = formatter.detect_supplier(ocr_text, rules)
+            if ocr_supplier and formatter.frame_matches_profile(raw, ocr_supplier, rules):
+                formatted = formatter.format_transactions(raw, ocr_supplier, rules)
+                supplier_key = ocr_supplier
+            else:
+                formatted = formatter.format_dynamic(raw, standard_columns=standard_columns)
+                supplier_key = extractor_pdf.DYNAMIC_SUPPLIER_KEY
     else:
         # Text pipeline (hybrid): resolve the supplier, then pick the mapper.
         detected = supplier_key

@@ -149,3 +149,50 @@ suppliers:
       "Room": "Room"
       "TIME": "Time"
       "رحله": "Trip"
+
+  hero:
+    # "Hero / Ayman Sharm Gate" — a very wide (~24 column), borderless
+    # invoice. It is usually supplied as an image (or a scanned PDF), so it is
+    # routed through the OCR pipeline, but the same profile is used whenever
+    # the text pipeline detects it too.
+    #
+    # The monetary column names are English while the row payload is Arabic;
+    # ``Rest*`` columns hold the still-outstanding remainder per currency and
+    # ``Total Invoice`` is the net balance (Total - Total REST), so it maps to
+    # the standard ``Net`` column rather than ``Total``.
+    identifiers:
+      - "Ayman Sharm Gate"
+      - "Ayman"
+      - "ايمان شارم جيت"      # recipient name, logical order (OCR / display)
+      - "تيج مراش ناميا"      # same name, visually-reversed text-PDF storage
+      - "T-InEgy"             # footer conversion labels (T-InEgy/Eng/Euro)
+      - "T-InEng"
+      - "T-InEuro"
+      - "Hero"
+    columns_mapping:
+      "Date": "Date"
+      "Hotel": "Hotel"
+      "Adults": "Adult"
+      "Child": "Child"
+      "Infant": "Inf"
+      "Egy LE": "EGP"
+      "Dollar": "USD"
+      "Euro": "Euros"
+      "Eng$": "GBP"
+      "Total": "Total"
+      "Total Invoice": "Net"
+      "Notes / Details": "V.NO"
+    # Everything else is folded into the standard "Notes" column, labelled.
+    notes_columns:
+      "Total REST": "Total REST"
+      "Rest£": "Rest £"
+      "Rest€": "Rest €"
+      "Rest$": "Rest $"
+      "Rest Egy": "Rest Egy"
+      "Dive2": "Dive2"
+      "Dive1": "Dive1"
+      "intro2": "intro2"
+      "intro1": "intro1"
+      "Nationality": "Nationality"
+      "Room/Tel": "Room/Tel"
+      "Trip": "Trip"

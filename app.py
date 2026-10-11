@@ -1,6 +1,15 @@
 """app.py
 
-Streamlit web interface for the local invoice extractor pipeline.
+Streamlit web interface for the flexible AI invoice extractor.
+
+The user types:
+  - Provider name (any name)
+  - Base URL (optional, from the provider's docs)
+  - Model name (free text)
+  - API key (password)
+
+The key is saved to a .env file under PROVIDER_API_KEY, where PROVIDER is the
+typed provider name in uppercase with spaces and dashes replaced by underscores.
 
 Run locally with:
 
@@ -15,151 +24,99 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-import extractor_ocr
-import formatter
-import main
+import ai_extract
+import exporter
 
 
-# Must be the first Streamlit command.
+# ---------------------------------------------------------------------------
+# Page configuration (must be the first Streamlit command)
+# ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Invoice & Table Extractor Pro",
+    page_title="Flexible AI Invoice Extractor",
     page_icon="🧾",
     layout="wide",
 )
 
-
-@st.cache_data
-def _rules():
-    """Load the supplier rules YAML (cached)."""
-    return formatter.load_rules()
-
-
-@st.cache_data
-def _standard_column_names():
-    """The canonical standard schema (for the detected-column denominator)."""
-    return list(_rules().get("standard_columns", []))
-
-
-@st.cache_data
-def _supplier_keys():
-    """Configured supplier profiles offered in the sidebar selector."""
-    return list(_rules().get("suppliers", {}).keys())
-
-
-def process_pdf(pdf_bytes: bytes, filename: str,
-                supplier_override: str | None = None,
-                engine: str = "auto"):
-    """Run the full pipeline on a single uploaded PDF or image (jpg/png).
-
-    Args:
-        pdf_bytes: Raw PDF/image file bytes.
-        filename: Original uploaded filename (used for the temp file + xlsx).
-        supplier_override: Explicit supplier key to force, or ``None`` to let
-            the pipeline auto-detect (profile when known, Smart Fallback when
-            not).
-        engine: Extraction engine - ``"auto"``, ``"text"`` or ``"ocr"``.
-
-    Returns:
-        tuple: (formatted DataFrame, summary dict, supplier key, detected
-        column count, xlsx bytes). ``supplier_key`` is the matched supplier when
-        a profile was used, else ``extractor_pdf.DYNAMIC_SUPPLIER_KEY``.
-    """
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp = Path(tmp_dir)
-        pdf_path = tmp / filename
-        pdf_path.write_bytes(pdf_bytes)
-
-        xlsx_path = tmp / f"{Path(filename).stem}.xlsx"
-
-        try:
-            out_path, formatted, summary, supplier_key = main.run(
-                pdf_path,
-                supplier_key=supplier_override,
-                output_path=xlsx_path,
-                engine=engine,
-            )
-        except extractor_ocr.OcrUnavailableError as exc:
-            raise ValueError(str(exc)) from exc
-
-        detected = main.count_detected_columns(formatted)
-        return formatted, summary, supplier_key, detected, out_path.read_bytes()
-
-
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar: provider name, base URL, model name, API key, Save key
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("🔑 Configure API")
 
-    st.markdown("**Processing mode**")
-    mode = st.radio(
-        "Input type",
-        options=["Auto-detect", "PDF (text-based)", "Image / Scanned (OCR)"],
-        index=0,
-        help=(
-            "Auto-detect uses the text layer when present and falls back to "
-            "OCR for scanned PDFs. Force 'Image / Scanned (OCR)' for "
-            "photographed or image-only invoices; force 'PDF (text-based)' to "
-            "skip OCR."
-        ),
+    provider_name = st.text_input(
+        "Provider name",
+        placeholder="e.g. my-invoice-service",
+        help="Any name you choose. Used to build the .env key name.",
     )
-    engine = {
-        "Auto-detect": "auto",
-        "PDF (text-based)": "text",
-        "Image / Scanned (OCR)": "ocr",
-    }[mode]
 
-    if extractor_ocr.is_ocr_available():
-        st.caption("🖼️ OCR ready (PaddleOCR · Arabic).")
-    else:
-        st.caption(
-            "ℹ️ OCR backend (PaddleOCR) not installed — the OCR mode will "
-            "report an error. See requirements.txt."
-        )
-        # Surface the exact import failure (e.g. a missing system library)
-        # in the UI and the app logs so deploy issues are diagnosable.
-        import_errors = extractor_ocr.ocr_import_errors()
-        for package, error in import_errors.items():
-            st.caption(f"⚠️ `{package}` import failed: `{error}`")
-        if import_errors:
-            print("OCR import failure details:", import_errors)
-
-    st.divider()
-
-    supplier_choice = st.selectbox(
-        "Supplier",
-        options=["Auto-detect"] + _supplier_keys(),
-        index=0,
-        help=(
-            "Auto-detect uses the supplier profile when the invoice matches a "
-            "known supplier, and Smart Fallback otherwise. Pick a supplier to "
-            "force its curated column mapping."
-        ),
+    base_url = st.text_input(
+        "Base URL",
+        placeholder="Optional - copy from provider's docs",
+        help="Leave empty if the API does not need a custom address.",
     )
-    supplier_override = None if supplier_choice == "Auto-detect" else supplier_choice
+
+    model_name = st.text_input(
+        "Model name",
+        placeholder="As written in the provider's docs",
+        help="Model name as provided by the API.",
+    )
+
+    api_key = st.text_input(
+        "API Key",
+        type="password",
+        help="Your API key. It is saved to a .env file in the project folder.",
+    )
+
+    col_save, col_clear = st.columns([1, 1])
+    with col_save:
+        save_clicked = st.button("Save key", type="primary")
+    with col_clear:
+        clear_clicked = st.button("Clear key")
+
+    if clear_clicked:
+        env_path = Path(".env")
+        if env_path.exists():
+            env_path.unlink()
+            st.success("API key cleared from .env")
+        else:
+            st.info("No .env file found to clear")
+
+    if save_clicked:
+        if not provider_name.strip():
+            st.error("Please enter a provider name before saving.")
+        elif not api_key.strip():
+            st.error("Please enter an API key before saving.")
+        else:
+            # Build the env key name: PROVIDER in uppercase, spaces and dashes
+            # replaced by underscores.
+            key_name = provider_name.strip().upper().replace(" ", "_").replace("-", "_")
+            env_path = Path(".env")
+            existing = ""
+            if env_path.exists():
+                existing = env_path.read_text(encoding="utf-8")
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write(f"{key_name}={api_key.strip()}\n")
+            st.success(f"API key saved to .env as {key_name}")
 
     st.caption(
-        "🧠 Auto-detect uses a supplier profile when one matches; unknown "
-        "suppliers are handled by Smart Fallback."
+        "Your key is written to `.env` in this project folder. "
+        "It is only used to call the API."
     )
 
 
 # ---------------------------------------------------------------------------
-# Main area
+# Main area: file uploader + process button + progress + results table
 # ---------------------------------------------------------------------------
-st.title("🧾 Invoice & Table Extractor Pro")
-st.caption("Upload invoice PDFs or image scans (JPG/JPEG/PNG) and export a standardized Excel workbook.")
-
-st.info(
-    "Processing all invoices with auto-detect... Known suppliers use their "
-    "profile; unknown suppliers fall back to Smart Fallback."
+st.title("🧾 Flexible AI Invoice Extractor")
+st.caption(
+    "Upload one or more invoices (PDF / JPG / JPEG / PNG) and extract their data "
+    "using any AI API you configure."
 )
 
 uploaded_files = st.file_uploader(
-    "Upload invoice file(s) (PDF or image)",
-    type=["pdf", "PDF", "jpg", "JPG", "jpeg", "JPEG", "png", "PNG"],
+    "Upload invoices",
+    type=["pdf", "jpg", "jpeg", "png"],
     accept_multiple_files=True,
-    help="Select one or more invoice files to process: PDF documents or direct images (jpg/jpeg/png).",
 )
 
 process_clicked = st.button(
@@ -168,54 +125,75 @@ process_clicked = st.button(
     disabled=not uploaded_files,
 )
 
-if process_clicked:
-    results = []
-    total = len(uploaded_files)
-    progress = st.progress(0.0, text=f"Processing 0/{total}…")
+# Validate that all required inputs are provided before processing.
+if uploaded_files and process_clicked:
+    if not provider_name.strip():
+        st.error("Please enter a provider name in the sidebar.")
+    elif not model_name.strip():
+        st.error("Please enter a model name in the sidebar.")
+    elif not api_key.strip():
+        st.error("Please enter an API key in the sidebar.")
+    else:
+        # Escape hatch: if the user typed a custom provider name, we still use
+        # the openai package with the provided base_url.
+        if not base_url.strip():
+            base_url_val = None
+        else:
+            base_url_val = base_url.strip()
 
-    for idx, uploaded in enumerate(uploaded_files, start=1):
-        progress.progress(
-            (idx - 1) / total, text=f"Processing {uploaded.name} ({idx}/{total})…"
-        )
-        try:
-            formatted, summary, supplier_key, detected, xlsx_bytes = process_pdf(
-                uploaded.getvalue(), uploaded.name, supplier_override, engine
-            )
-            results.append(
-                {
-                    "name": uploaded.name,
-                    "ok": True,
-                    "supplier": supplier_key,
-                    "detected": detected,
-                    "rows": len(formatted),
-                    "formatted": formatted,
-                    "summary": summary,
-                    "xlsx": xlsx_bytes,
-                    "error": None,
-                }
-            )
-        except Exception as exc:  # noqa: BLE001 - surface any failure in the UI
-            results.append(
-                {
-                    "name": uploaded.name,
-                    "ok": False,
-                    "supplier": None,
-                    "detected": 0,
-                    "rows": 0,
-                    "formatted": None,
-                    "summary": None,
-                    "xlsx": None,
-                    "error": str(exc),
-                }
-            )
-        progress.progress(idx / total, text=f"Processed {uploaded.name}")
+        results = []
+        total = len(uploaded_files)
+        progress = st.progress(0.0, text=f"Processing 0/{total}…")
 
-    progress.empty()
-    st.session_state["results"] = results
+        for idx, uploaded in enumerate(uploaded_files, start=1):
+            progress.progress(
+                (idx - 1) / total,
+                text=f"Processing {uploaded.name} ({idx}/{total})…",
+            )
+            try:
+                # Read the key from .env (if it exists) as a fallback.
+                key = api_key.strip()
+                df = ai_extract.extract_invoice_to_dataframe(
+                    uploaded.getvalue(),
+                    uploaded.name,
+                    base_url=base_url_val,
+                    model=model_name.strip(),
+                    api_key=key,
+                )
+                results.append(
+                    {
+                        "name": uploaded.name,
+                        "ok": True,
+                        "df": df,
+                        "error": None,
+                    }
+                )
+            except ValueError as exc:
+                # Per-file failure: do not stop the others.
+                results.append(
+                    {
+                        "name": uploaded.name,
+                        "ok": False,
+                        "df": None,
+                        "error": str(exc),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - surface any failure in the UI
+                results.append(
+                    {
+                        "name": uploaded.name,
+                        "ok": False,
+                        "df": None,
+                        "error": f"Unexpected error: {exc}",
+                    }
+                )
+            progress.progress(idx / total, text=f"Processed {uploaded.name}")
 
+        progress.empty()
+        st.session_state["results"] = results
 
 # ---------------------------------------------------------------------------
-# Results
+# Results display + download
 # ---------------------------------------------------------------------------
 results = st.session_state.get("results")
 if results:
@@ -228,31 +206,37 @@ if results:
     if ok:
         st.success(f"✅ Processed {len(ok)} of {len(results)} invoice(s) successfully.")
 
-        combined = pd.concat([r["formatted"] for r in ok], ignore_index=True)
-        st.subheader("📄 Extracted table (standard schema)")
+        # Combine all successful extractions into one table.
+        combined = pd.concat([r["df"] for r in ok], ignore_index=True)
+
+        st.subheader("📄 Extracted table")
         st.dataframe(combined)
 
-        total_detected = len(_standard_column_names())
-        st.caption(
-            f"🧠 {len(ok)} invoice(s) · detected columns: "
-            f"{sum(r['detected'] for r in ok)}/{total_detected}"
-        )
-
         st.subheader("⬇️ Download Excel")
-        for i, r in enumerate(ok):
-            stem = Path(r["name"]).stem
-            st.download_button(
-                label=f"📥 Download {stem}.xlsx",
-                data=r["xlsx"],
-                file_name=f"{stem}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"download_{i}_{stem}",
-            )
-            st.caption(
-                f"Supplier: {main.supplier_label(r['supplier'])} · "
-                f"{r['detected']}/{total_detected} columns detected · "
-                f"{r['rows']} rows"
-            )
+
+        # Build one Excel file from the combined results.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            output_path = tmp / "invoices.xlsx"
+
+            try:
+                exporter.export_to_excel(
+                    combined,
+                    output_path,
+                    sheet_name="Invoices",
+                    total_label="Total",
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"❌ Could not build Excel: {exc}")
+            else:
+                st.download_button(
+                    label="📥 Download invoices.xlsx",
+                    data=output_path.read_bytes(),
+                    file_name="invoices.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument."
+                          "spreadsheetml.sheet",
+                    type="primary",
+                )
 
     if failed and not ok:
         st.info("No invoices could be processed. Review the errors above and try again.")

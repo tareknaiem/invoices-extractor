@@ -468,6 +468,142 @@ def test_narrow_table_still_drops_sparse_rows():
 
 
 # ---------------------------------------------------------------------------
+# 6. Hero / Ayman Sharm Gate: wide borderless invoice + invoice-id guards
+# ---------------------------------------------------------------------------
+HERO_HEADERS = [
+    "Total Invoice", "Total REST", "Rest£", "Rest€", "Rest$", "Rest Egy",
+    "Total", "Eng$", "Euro", "Dollar", "Egy LE", "Dive2", "Dive1",
+    "intro2", "intro1", "Nationality", "Notes / Details", "Room/Tel",
+    "Infant", "Child", "Adults", "Hotel", "Trip", "Date",
+]
+
+HERO_ROW = [
+    "915-", "3,315", "-", "122", "-", "2,400",
+    "2,600", "-", "56", "3,600", "2,400", "-", "-",
+    "-", "-", "ايطاليا", "TG2026-5315", "393895769302+",
+    "0", "1", "2", "فندق نعمه ساتر", "الرحلة الرئيسية", "2026-09-10",
+]
+
+
+def _hero_raw_frame():
+    return pd.DataFrame([HERO_ROW], columns=HERO_HEADERS)
+
+
+def test_hero_profile_is_configured():
+    rules = formatter.load_rules()
+    assert "hero" in rules["suppliers"]
+    mapping = rules["suppliers"]["hero"]["columns_mapping"]
+    standard = set(rules["standard_columns"])
+    assert set(mapping.values()) <= standard
+    assert len(mapping) >= 12
+    assert not set(mapping) & set(rules["suppliers"]["hero"]["notes_columns"])
+
+
+def test_hero_supplier_detected_from_identifiers():
+    rules = formatter.load_rules()
+    assert formatter.detect_supplier("recipient: Ayman Sharm Gate", rules) == "hero"
+    assert formatter.detect_supplier("footer T-InEgy T-InEng T-InEuro", rules) == "hero"
+    assert formatter.detect_supplier("ايمان شارم جيت", rules) == "hero"
+    # The reversed Arabic spelling (text-PDF storage) is detected too.
+    assert formatter.detect_supplier("تيج مراش ناميا", rules) == "hero"
+    # Other suppliers still win on their own identifiers.
+    assert formatter.detect_supplier("Egypt Gate invoice", rules) == "egypt_gate"
+
+
+def test_hero_profile_maps_wide_invoice_frame():
+    raw = extractor_pdf._clean_dataframe(_hero_raw_frame(), fix_arabic=False)
+    formatted = formatter.format_transactions(raw, "hero")
+    assert list(formatted.columns) == STANDARD_COLUMNS
+
+    assert formatted["Net"].iloc[0] == -915
+    assert formatted["Total"].iloc[0] == 2600
+    assert formatted["EGP"].iloc[0] == 2400
+    assert formatted["USD"].iloc[0] == 3600
+    assert formatted["Euros"].iloc[0] == 56
+    assert pd.isna(formatted["GBP"].iloc[0])
+    assert formatted["V.NO"].iloc[0] == "TG2026-5315"
+    assert formatted["Hotel"].iloc[0] == "فندق نعمه ساتر"
+    assert formatted["Adult"].iloc[0] == 2
+    assert formatted["Child"].iloc[0] == 1
+    assert formatted["Inf"].iloc[0] == 0
+    assert formatted["Date"].iloc[0] == "2026-09-10"
+
+    notes = str(formatted["Notes"].iloc[0])
+    assert "Total REST: 3315" in notes
+    assert "Rest €: 122" in notes
+    assert "Trip: الرحلة الرئيسية" in notes
+    assert "Room/Tel: 393895769302+" in notes
+    assert "Nationality: ايطاليا" in notes
+
+    assert formatted["EGP Converter"].isna().all()
+    assert not (formatted.astype(str) == "2609131157").any().any()
+
+
+def test_hero_profile_resolves_noisy_ocr_headers():
+    noisy = pd.DataFrame(
+        [["1-Sep", "Hilton", "2", "0", "0", "2400", "120", "90", "2600",
+          "TG2026-5315", "الرحلة"]],
+        columns=[
+            "Date", "Hotel", "Adults", "Child", "Infant", "Egy LE", "Dollar",
+            "Euro", "Total", "Notes/Details", "Trip",
+        ],
+    )
+    formatted = formatter.format_transactions(noisy, "hero")
+    assert formatted["V.NO"].iloc[0] == "TG2026-5315"
+    assert formatted["EGP"].iloc[0] == 2400
+    assert formatted["USD"].iloc[0] == 120
+
+
+def test_frame_matches_profile_gates_profiles():
+    assert formatter.frame_matches_profile(_hero_raw_frame(), "hero") is True
+    unrelated = pd.DataFrame(columns=["Dt", "Hotel", "Ad.", "ch", "Cost"])
+    assert formatter.frame_matches_profile(unrelated, "hero") is False
+
+
+def test_eng_dollar_header_is_gbp():
+    assert formatter.detect_header_currency("Eng$") == "GBP"
+    mapping = formatter.build_column_mapping(["Dollar", "Eng$", "Euro", "Egy LE"])
+    assert mapping == {
+        "Dollar": "USD", "Eng$": "GBP", "Euro": "Euros", "Egy LE": "EGP",
+    }
+
+
+def test_invoice_meta_strip_goes_to_summary_not_data():
+    meta = [
+        ["TOTAL", "RECORDS", "PERIOD", "RECIPIENT", "INVOICE DATE", "INVOICE NO"],
+        ["-10,353 LE", "27 items", "2026-09-10 → 2026-09-13", "Ayman Sharm Gate",
+         "Sep 13, 2026", "2609131157"],
+    ]
+    main_table = [
+        ["Date", "Hotel", "Adults", "Egy LE", "Total", "Notes / Details"],
+        ["2026-09-10", "Hilton", "2", "2400", "2600", "TG2026-5315"],
+        ["2026-09-11", "Marriott", "1", "1500", "1800", "TG2026-6339"],
+    ]
+    raw, summary = extractor_pdf.tables_to_transactions(
+        [meta, main_table], fix_arabic=False
+    )
+    assert summary.get("INVOICE NO") == "2609131157"
+    assert summary.get("TOTAL") == -10353
+    assert len(raw) == 2
+    assert not raw.astype(str).apply(
+        lambda col: col.str.contains("2609131157")
+    ).any().any()
+
+    formatted = formatter.format_dynamic(raw)
+    assert formatted["EGP Converter"].isna().all()
+    assert not (formatted.astype(str) == "2609131157").any().any()
+
+
+def test_invoice_number_not_parsed_as_currency():
+    assert extractor_pdf._clean_currency("2609131157") == "2609131157"
+    assert extractor_pdf._clean_currency("915-") == -915
+    assert extractor_pdf._clean_currency("-10,353 LE") == -10353
+    assert extractor_pdf._clean_currency("2,400") == 2400
+    assert extractor_pdf._clean_currency("( 23,756.00)") == -23756.0
+    assert extractor_pdf._clean_currency("-") == ""
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner (no pytest required)
 # ---------------------------------------------------------------------------
 def _run_all():

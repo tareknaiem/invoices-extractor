@@ -36,10 +36,10 @@ engine="auto", ocr_engine=None, ocr_resolution=None, ocr_max_pages=None)` الت
 | **`main.py`** | المنسّق (Orchestrator): دالة `run()` تمزج المسارين وتكتب الإكسل. `_resolve_engine()` يختار محرك الاستخراج. `ENGINES = ("auto", "text", "ocr")`. |
 | **`app.py`** | واجهة Streamlit: رفع PDF متعدد، شريط جانبي (وضع المعالجة: Auto/Text/OCR، اختيار المورّد يدويًا أو Auto-detect)، تنفيذ عبر `process_pdf()` → `main.run()`، عرض `st.dataframe` + أزرار تحميل `st.download_button` + رسائل نجاح/خطأ لكل ملف. يعمل بذاكرة مؤقتة (`tempfile.TemporaryDirectory`). |
 | **`extractor_pdf.py`** | محرك النص: استخراج الجداول بـ pdfplumber، كشف صف العناوين (`detect_header_row`)، تنظيف الخلايا والعملات (`_clean_currency`)، تصحيح عربي الترتيب البصري (`_fix_arabic`)، فصل صفوف/جداول الملخّص (`_is_summary_table`, `_drop_summary_rows`)، كشف ضوضاء `(cid:NN)` (`has_cid_garbage`)، ومحرك الـ **Smart Fallback** للمورّدين المجهولين (`smart_extract_tables` / `smart_fallback_extract`). ثابت `DYNAMIC_SUPPLIER_KEY = "auto_detected"`. |
-| **`extractor_ocr.py`** | محرك البصري: تحويل الصفحات لصور (`render_pdf_pages`, افتراضي 300 DPI)، تغليف `PaddleOcrEngine` ( كسول، يدعم API ‏v3/v2 مع تدرّج في التوافق)، تطبيع مخرجات Paddle (`_parse_paddle_result`)، إعادة بناء جدول من صناديق النص (`lines_to_rows` → `column_bands` → `lines_to_table`)، وقطّاع التوجيه `should_use_ocr()`. `ocr_dependency_status()` / `is_ocr_available()` لحالة المحرك. |
-| **`formatter.py`** | المنسّق: تحويل لأي إطار إلى الهيكل القياسي `standard_columns`. مساران: `format_transactions()` بملف المورّد (`columns_mapping`) أو `format_dynamic()` بالمطابقة الضبابية (`build_column_mapping` ← `best_standard_match` + `detect_header_currency`). كذلك: `detect_supplier()`, تطبيع التواريخ إلى `YYYY-MM-DD`, أعداد `Adult/Child/Inf` صحيحة، طيّ زائد الأعمدة في `Notes`، ومرادفات متعددة اللغات `STANDARD_COLUMN_ALIASES` (عربية + معكوسة). عتبة القبول `FUZZY_MATCH_THRESHOLD = 0.80`. |
+| **`extractor_ocr.py`** | محرك البصري: تحويل الصفحات لصور (`render_pdf_pages`, افتراضي 300 DPI) مع زيادة التباين بدون تكبير (`preprocess_for_ocr`, `OCR_UPSCALE_FACTOR = 1.0` لتفادي OOM)، تغليف `PaddleOcrEngine` (كسول، يدعم API ‏v3/v2 مع تدرّج في التوافق)، تطبيع مخرجات Paddle (`_parse_paddle_result`)، إعادة بناء جدول من صناديق النص. **للمورّدين المعروفين:** `template_lines_to_table` يعيد البناء من قالب أعمدة مستنتَج من إحداثيات X لصف العناوين مع تقسيم صناديق الأرقام المدمجة غير المنقسمة بسطور (`_split_discrete_numeric_values`). للمجهولين: `lines_to_rows` (تجميع صارم) → `_header_bands`/`column_bands` → `lines_to_table`. وقطّاع التوجيه `should_use_ocr()`. `ocr_dependency_status()` / `is_ocr_available()` لحالة المحرك. |
+| **`formatter.py`** | المنسّق: تحويل لأي إطار إلى الهيكل القياسي `standard_columns`. مساران: `format_transactions()` بملف المورّد (`columns_mapping`، مع حلّ ضبابي لمفاتيحه على رؤوس الإطار عبر `_resolve_column`) أو `format_dynamic()` بالمطابقة الضبابية (`build_column_mapping` ← `best_standard_match` + `detect_header_currency`). كذلك: `detect_supplier()`, `frame_matches_profile()` (قبول ملف مورّد على مسار OCR)، تطبيع التواريخ إلى `YYYY-MM-DD`, أعداد `Adult/Child/Inf` صحيحة، طيّ زائد الأعمدة في `Notes`، ومرادفات متعددة اللغات `STANDARD_COLUMN_ALIASES` (عربية + معكوسة). عتبة القبول `FUZZY_MATCH_THRESHOLD = 0.80`. |
 | **`exporter.py`** | المُصدّر: `export_to_excel(df, output_path, summary, sheet_name="Invoices", total_label="Total")`. يبني: كتلة أسعار الصرف القابلة للتحرير (صفوف 1–3؛ `$B$2` USD=50، `$D$2` EUR=55، `$F$2` GBP=65)، معادلات حيّة في `EGP Converter` لكل صف (`=N(EGP)+N(USD)*$B$2+…`)، صف Subtotal بـ `=SUM(...)` لكل عمود مالي، تنسيقات/حدود/AutoFilter/تجميد، وأوراق ملخّص اختيارية. `HEADER_ROW = 4`. |
-| **`suppliers_rules.yaml`** | الإعداد: `standard_columns` (14 عمودًا: EGP Converter, EGP, GBP, Euros, USD, V.NO, Hotel, Date, Adult, Child, Inf, Total, Notes, Net) + 6 مورّدين (`egypt_gate`, `sharm_gate`, `egypt_gate_bebo`, `egypt_gate_sinai`, `sharm_gate_mohamed`, `smile_safari`) كل بـ `identifiers` و`columns_mapping` و`notes_columns`. |
+| **`suppliers_rules.yaml`** | الإعداد: `standard_columns` (14 عمودًا: EGP Converter, EGP, GBP, Euros, USD, V.NO, Hotel, Date, Adult, Child, Inf, Total, Notes, Net) + 7 مورّدين (`egypt_gate`, `sharm_gate`, `egypt_gate_bebo`, `egypt_gate_sinai`, `sharm_gate_mohamed`, `smile_safari`, `hero`) كل بـ `identifiers` و`columns_mapping` و`notes_columns`. |
 | **`tests/test_fallback_extractor.py`** | 17 اختبارًا: المطابكة الضبابية والعملات، كشف صف العناوين، الـ Smart Fallback (بيانات عربية)، صيغ `EGP Converter` و`SUM` في التصدير، و`main.run()` مع مورّد مجهول. يعمل مباشرة بدون pytest. |
 | **`tests/test_ocr_pipeline.py`** | 24 اختبارًا: كشف/تنظيف `(cid:)`، قطّاع التوجيه، الرسم بياني للصفحات، تحليل مخرجات Paddle v2/v3، بناء الجدول من الصناديق، ونهاية-لنهاية عبر محرك وهمي (`_FakeEngine`) يؤكد بقاء صيغ `SUM` + `EGP Converter`. يعمل مباشرة بدون pytest. |
 | **`constitution.md`** | قواعد العمل الإلزامية (تكامل، أمان، عربي/إكسل، تحقق 100%). |
@@ -97,11 +97,14 @@ get_pdf_text(pdf) ──► formatter.detect_supplier(text, rules)
 ```
 extractor_ocr.extract_transactions_from_pdf(pdf, rules, engine, resolution, max_pages)
    │   render_pdf_pages (300 DPI) ─► PaddleOcrEngine.recognize (lang='ar')
-   │   ─► lines_to_rows / column_bands / lines_to_table   # إعادة بناء شبكة الجدول
+   │   ─► formatter.detect_supplier(ocr_text, rules)   # كشف المورّد من النص الكامل
+   │   ─► مورّد معروف: template_lines_to_table   # قالب أعمدة من إحداثيات X لصف العناوين
+   │   ─► مجهول: lines_to_rows / _header_bands|column_bands / lines_to_table
    │   ─► extractor_pdf.tables_to_transactions(fix_arabic=False)  # عربي أصلًا بالمنطق السليم
    │   (يُعاد أيضًا ocr_text كامل)
-   ├─► formatter.detect_supplier(ocr_text, rules)     # إن لم يُحدَّد يدويًا
-   └─► formatter.format_dynamic(raw, standard_columns)  # دائمًا: رؤوس OCR ضوضائية
+   └─► إن تطابق معرف مورّد ورؤوسه مع الإطار (formatter.frame_matches_profile):
+         formatter.format_transactions(raw, supplier_key)   # ملف المورّد
+        وإلا formatter.format_dynamic(raw, standard_columns) # رؤوس OCR ضوضائية
         └─► إن المورّد غير معروف: supplier_key = DYNAMIC_SUPPLIER_KEY
 ```
 
@@ -111,8 +114,9 @@ extractor_ocr.extract_transactions_from_pdf(pdf, rules, engine, resolution, max_
   في **الاستخراج فقط**، لا في التنسيق أو التصدير.
 - OCR يستخدم `fix_arabic=False` لأن Paddle يعيد النص بالترتيب المنطقي أصلًا،
   بينما مسار النص يستخدم `fix_arabic=True` لتقليل النص المخزّن بالترتيب البصري.
-- المورّد غير المعروف في المسار النصي يعمل عبر Smart Fallback، أما OCR فلا
-  يستخدم ملفات المورّدين إطلاقًا (التوافق الضبابي فقط).
+- المورّد غير المعروف في المسار النصي يعمل عبر Smart Fallback، أما OCR فيستخدم
+  ملف مورّد فقط عند تطابق معرفه ورؤوسه مع الإطار (`frame_matches_profile`)، وإلا
+  التوافق الضبابي (`format_dynamic`).
 - غياب PaddleOCR لا يوقف مسار النص: `OcrUnavailableError` تحمل رسالة إرشادية
   تُلتقط في `app.py` وتظهر كخطأ في الواجهة.
 
