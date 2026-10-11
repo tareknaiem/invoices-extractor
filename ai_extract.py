@@ -29,15 +29,39 @@ STANDARD_COLUMNS = [
 ]
 
 # Same prompt for every provider; it fixes the JSON output format:
-# dates as YYYY-MM-DD, plain numbers, empty strings for unknown values.
+# {"rows": [...], "footer": {"total": .., "net": ..}} with dates as
+# YYYY-MM-DD, plain numbers, and empty strings for unknown values.
 SYSTEM_PROMPT = (
     "You are an invoice extraction assistant. For every invoice you receive, "
-    "reply with ONLY a JSON array of objects. No narration, no markdown, no "
-    "code fences. Each object MUST have exactly these keys (in any order): "
-    "Date, Hotel, V.NO, Adult, Child, Inf, EGP, USD, Euros, GBP, Total, Net, Notes. "
-    "The model returns one object per invoice line/row.\n\n"
+    "reply with ONLY one JSON object. No narration, no markdown, no code fences. "
+    "The object MUST have exactly these two keys: \"rows\" and \"footer\".\n\n"
+    "\"rows\": an array of objects, one per invoice line/row. Each object MUST "
+    "have exactly these keys (in any order): "
+    "Date, Hotel, V.NO, Adult, Child, Inf, EGP, USD, Euros, GBP, Total, Net, Notes.\n\n"
+    "\"footer\": an object with exactly two keys: \"total\" (the invoice total "
+    "shown in the footer/summary area of the invoice, as a plain number) and "
+    "\"net\" (the footer net/total invoice value, as a plain number). If a "
+    "footer value is not visible, use null.\n\n"
+    "Example shape:\n"
+    '{"rows": [{"Date": "2026-09-15", "Hotel": "", "V.NO": "TG-2026-1234",'
+    ' "Adult": 2, "Child": 0, "Inf": 0, "EGP": 0, "USD": 100, "Euros": 0,'
+    ' "GBP": 0, "Total": 100, "Net": 95, "Notes": ""}],'
+    ' "footer": {"total": 100, "net": 95}}\n\n'
     "Rules:\n"
-    "- Date: YYYY-MM-DD (e.g. 2026-09-15).\n"
+    "- Date: copy the date exactly as printed on the invoice. If the invoice "
+    "prints the full date, you may normalize it to YYYY-MM-DD (e.g. "
+    "2026-09-15). If the year is NOT printed, return only the day and month "
+    '(e.g. 09-15). NEVER guess or invent a year (e.g. do not add "2026").\n'
+    "- Adult, Child, Inf: fill them ONLY when the invoice clearly labels "
+    'people counts (e.g. "Adult", "Child", "Inf" headers or explicit pax '
+    'counts). Codes such as "2S", "2D", "1D+Cal" are room/service codes, '
+    "NOT person counts: leave the count as 0 in that case.\n"
+    "- V.NO: the voucher number found in the invoice's \"Notes / Details\" "
+    "column (e.g. TG-2026-1234). Never put voucher numbers in \"Notes\".\n"
+    "- Notes: put the FULL text of the \"Situation\" or service column "
+    '(e.g. "2S+1D+Cal", "Cal", "Ar") plus any remarks (e.g. "شامل عده", '
+    '"جايد تركي", "2قطعه"), so nothing from the original invoice is lost. '
+    "Use an empty string only if there is nothing at all.\n"
     "- Numbers (Adult, Child, Inf, EGP, USD, Euros, GBP, Total, Net): plain numbers "
     "without commas, currency symbols, or spaces. Use 0 for missing amounts.\n"
     '- Unknown text values (Hotel, V.NO, Notes): empty string "".\n'
@@ -85,8 +109,75 @@ def _build_user_content(file_bytes: bytes, filename: str) -> list[dict]:
     ]
 
 
-def _parse_json(text: str) -> list[dict]:
-    """Strip markdown code fences (if present) and parse the JSON payload.
+def _to_number(value) -> float | None:
+    """Return value as a float, or None if it is missing or not numeric.
+
+    Tolerates numbers sent as strings (e.g. "1,234.50") because models do
+    not always obey the "plain numbers" instruction perfectly.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def _check_review(df: pd.DataFrame, footer: dict | None) -> str:
+    """Compare the row sums with the invoice footer totals.
+
+    Returns one value for the whole invoice:
+      - "OK"        the sums match the footer (difference of up to 1 allowed)
+      - "MISMATCH"  a sum differs from the footer by more than 1
+      - "NO FOOTER" the AI did not see a footer (footer is null)
+    """
+    if not footer:
+        return "NO FOOTER"
+
+    def column_sum(name: str) -> float:
+        total = 0.0
+        for value in df[name]:
+            number = _to_number(value)
+            if number is not None:
+                total += number
+        return total
+
+    verdicts = []
+
+    footer_total = _to_number(footer.get("total"))
+    if footer_total is None:
+        verdicts.append("NO FOOTER")
+    else:
+        verdicts.append(
+            "OK" if abs(column_sum("Total") - footer_total) <= 1 else "MISMATCH"
+        )
+
+    footer_net = _to_number(footer.get("net"))
+    if footer_net is not None:
+        verdicts.append(
+            "OK" if abs(column_sum("Net") - footer_net) <= 1 else "MISMATCH"
+        )
+
+    # Any real mismatch wins; otherwise any missing footer value; else OK.
+    if "MISMATCH" in verdicts:
+        return "MISMATCH"
+    if "NO FOOTER" in verdicts:
+        return "NO FOOTER"
+    return "OK"
+
+
+def _parse_json(text: str) -> tuple[list[dict], dict | None]:
+    """Strip markdown code fences (if present) and parse the AI answer.
+
+    The AI is asked for {"rows": [...], "footer": {...}}. A plain array is
+    also accepted (older answers) with footer set to None.
+
+    Returns:
+        (rows, footer): the row objects, and the footer dict or None.
 
     Raises ValueError with a clear message if parsing fails.
     """
@@ -108,13 +199,27 @@ def _parse_json(text: str) -> list[dict]:
             f"Raw answer was: {cleaned[:300]}"
         ) from exc
 
-    if not isinstance(data, list):
+    footer = None
+    if isinstance(data, dict):
+        rows = data.get("rows")
+        if not isinstance(rows, list):
+            raise ValueError(
+                'Expected the AI answer to contain a "rows" array, '
+                f"but got {type(rows).__name__}."
+            )
+        raw_footer = data.get("footer")
+        if isinstance(raw_footer, dict):
+            footer = raw_footer
+    elif isinstance(data, list):
+        # Older/other answers: a plain array of rows, no footer.
+        rows = data
+    else:
         raise ValueError(
-            "Expected a JSON array of invoice rows from the AI, "
+            "Expected a JSON object or array from the AI, "
             f"but got {type(data).__name__}."
         )
 
-    for i, row in enumerate(data):
+    for i, row in enumerate(rows):
         if not isinstance(row, dict):
             raise ValueError(f"Row {i + 1} of the AI answer is not an object.")
         missing = set(STANDARD_COLUMNS) - set(row)
@@ -125,7 +230,7 @@ def _parse_json(text: str) -> list[dict]:
                 f"Missing: {sorted(missing) or 'none'}. "
                 f"Unexpected: {sorted(extra) or 'none'}."
             )
-    return data
+    return rows, footer
 
 
 def extract_invoice_to_dataframe(
@@ -145,7 +250,8 @@ def extract_invoice_to_dataframe(
         api_key: API key typed by the user.
 
     Returns:
-        DataFrame with the STANDARD_COLUMNS columns, in that order.
+        DataFrame with the STANDARD_COLUMNS columns (in that order) plus a
+        Review column: "OK", "MISMATCH", or "NO FOOTER" (row sums vs. footer).
 
     Raises:
         ValueError: On empty inputs, on API failures (including a clear
@@ -184,8 +290,11 @@ def extract_invoice_to_dataframe(
     if not text.strip():
         raise ValueError("The API returned an empty response.")
 
-    rows = _parse_json(text)
+    rows, footer = _parse_json(text)
     normalized = [
         {key: row.get(key, "") for key in STANDARD_COLUMNS} for row in rows
     ]
-    return pd.DataFrame(normalized, columns=STANDARD_COLUMNS)
+    df = pd.DataFrame(normalized, columns=STANDARD_COLUMNS)
+    # Automatic totals check: compare the row sums with the invoice footer.
+    df["Review"] = _check_review(df, footer)
+    return df

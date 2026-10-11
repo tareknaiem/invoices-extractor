@@ -165,6 +165,7 @@ if uploaded_files and process_clicked:
                         "name": uploaded.name,
                         "ok": True,
                         "df": df,
+                        "review": df["Review"].iloc[0] if not df.empty else "",
                         "error": None,
                     }
                 )
@@ -205,6 +206,21 @@ if results:
 
     if ok:
         st.success(f"✅ Processed {len(ok)} of {len(results)} invoice(s) successfully.")
+
+        # Automatic totals check: warn about invoices that need a second look.
+        flagged = [
+            (r["name"], r["review"])
+            for r in ok
+            if r.get("review") in ("MISMATCH", "NO FOOTER")
+        ]
+        if flagged:
+            listing = "\n".join(
+                f"- **{name}**: {review}" for name, review in flagged
+            )
+            st.warning(
+                "⚠️ Please double-check these invoice(s) before using the numbers:\n\n"
+                + listing
+            )
 
         # Combine all successful extractions into one table.
         combined = pd.concat([r["df"] for r in ok], ignore_index=True)
