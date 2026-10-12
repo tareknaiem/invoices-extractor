@@ -48,6 +48,7 @@ Design notes
 
 from __future__ import annotations
 
+import os
 import tempfile
 import uuid
 from pathlib import Path
@@ -56,7 +57,7 @@ from typing import Optional
 import pandas as pd
 from dotenv import dotenv_values, set_key, unset_key
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
@@ -268,6 +269,53 @@ def clear_config() -> dict:
         for key in (CFG_PROVIDER, CFG_BASE_URL, CFG_MODEL, CFG_API_KEY):
             unset_key(ENV_PATH, key)
     return {"ok": True, "existed": existed}
+
+
+@app.post("/api/models")
+async def fetch_models(base_url: str = Form(...), api_key: str = Form("")):
+    """Fetch the available models from the provider's OpenAI-compatible API.
+
+    The request is proxied through the backend so the browser never hits the
+    provider directly (avoids CORS issues and keeps the key server-side). The
+    key is resolved from the request first, then from the saved ``.env`` config.
+    The blocking HTTP call runs in a worker thread so the event loop is not
+    stalled.
+    """
+    def _fetch() -> dict:
+        import requests
+
+        # Resolve the API key: request value first, then the saved config.
+        actual_key = (api_key or "").strip()
+        if not actual_key:
+            actual_key = _read_config()["api_key"]
+        if not actual_key:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "API key is missing"},
+            )
+
+        url = f"{base_url.rstrip('/')}/models"
+        headers = {"Authorization": f"Bearer {actual_key}"}
+
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid JSON from provider: {exc}"},
+            )
+
+        model_ids = [m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m]
+        return {"models": model_ids}
+
+    return await run_in_threadpool(_fetch)
+
 
 @app.post("/api/extract")
 async def extract_invoices(

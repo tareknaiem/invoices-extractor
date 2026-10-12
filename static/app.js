@@ -69,6 +69,7 @@ const providerInput = $("#provider");
 const baseUrlInput = $("#base_url");
 const modelInput = $("#model");
 const modelOptions = $("#model-options");
+const fetchModelsBtn = $("#fetchModelsBtn");
 const apiKeyInput = $("#api_key");
 const toggleKeyBtn = $("#toggle-key");
 const keyStatus = $("#key-status");
@@ -488,6 +489,51 @@ function formatBytes(bytes) {
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
   return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 }
+
+// ---------------------------------------------------------------------------
+// Fetch Models button: ask the backend to list the provider's models
+// (proxied server-side to avoid CORS), then populate the model datalist.
+// ---------------------------------------------------------------------------
+fetchModelsBtn.addEventListener("click", async () => {
+  const originalText = fetchModelsBtn.textContent;
+  fetchModelsBtn.disabled = true;
+  fetchModelsBtn.textContent = "⏳...";
+
+  const data = new FormData();
+  data.append("base_url", baseUrlInput.value.trim());
+  data.append("api_key", apiKeyInput.value.trim());
+
+  try {
+    const res = await fetch("/api/models", { method: "POST", body: data });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      window.alert(payload.error || "Could not fetch models.");
+      fetchModelsBtn.textContent = originalText;
+      fetchModelsBtn.disabled = false;
+      return;
+    }
+
+    // Replace the datalist suggestions with the fetched models.
+    modelOptions.innerHTML = "";
+    (payload.models || []).forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m;
+      modelOptions.appendChild(opt);
+    });
+
+    // Briefly confirm success, then revert.
+    fetchModelsBtn.textContent = "✅ Done";
+    setTimeout(() => {
+      fetchModelsBtn.textContent = originalText;
+      fetchModelsBtn.disabled = false;
+    }, 1500);
+  } catch (err) {
+    window.alert("Network error while fetching models.");
+    fetchModelsBtn.textContent = originalText;
+    fetchModelsBtn.disabled = false;
+  }
+});
+
 
 // ---------------------------------------------------------------------------
 // Init
