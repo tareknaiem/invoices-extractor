@@ -9,7 +9,7 @@
 إكسل موحّد:
 
 ```
-PDF → extractor (نص أو OCR) → formatter (الهيكل القياسي) → exporter (إكسل حيّ) → Streamlit UI
+PDF → extractor (نص أو OCR) → formatter (الهيكل القياسي) → exporter (إكسل حيّ) → FastAPI + واجهة ويب (server.py + static/)
 ```
 
 نقطة الدخول الموحّدة: `main.run(pdf_path, supplier_key=None, output_path=None,
@@ -21,10 +21,10 @@ engine="auto", ocr_engine=None, ocr_resolution=None, ocr_max_pages=None)` الت
 | المكتبة | الإصدار | الدور |
 |---|---|---|
 | **Python** | 3.11 (بيئة `venv/`) | لغة المشروع؛ ملاحظة: عجلات Paddle تدعم 3.9–3.13 فقط، لذا OCR قد يكون غير متاح على 3.14 |
-| **Streamlit** | 1.64.0 | واجهة الويب في `app.py` (`streamlit run app.py`) |
+| **FastAPI / Uvicorn** | 0.143 / 0.54 | خادم الواجهة الخلفية في `server.py` (`uvicorn server:app`)، يقدّم واجهة الويب الثابتة و REST API للتهيئة والاستخراج. |
 | **pdfplumber** | 0.11.10 | استخراج النصوص والجداول من PDF النصي + تحويل الصفحات إلى صور للـ OCR عبر محرك pypdfium2 المدمج |
 | **PaddleOCR / PaddlePaddle** | 3.7.0 / 3.4.0 | محرك OCR العربي (`lang='ar'`) — اختياري، يُستورد بشكل كسول (lazy) ويُبلّغ `OcrUnavailableError` إن غاب |
-| **protobuf** | 7.36.2 (`>=5.26.1,<8`) | القيد المشترك بين streamlit وpaddlepaddle؛ سطر paddlepaddle 2.x يطلب `<=3.20.2` فيتعارض مع streamlit ويسبّب `TypeError: Descriptors cannot be created directly` |
+| **protobuf** | 7.36.2 (`>=5.26.1,<8`) | تبعية paddlepaddle؛ مع إزالة Streamlit انحلّ تعارض `protobuf` السابق بينهما (سطر paddlepaddle 2.x كان يطلب `<=3.20.2` ويسبّب `TypeError: Descriptors cannot be created directly` مع streamlit). |
 | **RapidFuzz** | 3.14.6 | مطابقة أعمدة سريعة (Fuzzy) في `formatter`؛ يسقط تلقائيًا إلى `difflib` المكتبة القياسية إن لم يُثبَّت |
 | **OpenPyXL** | 3.1.5 | كتابة ملف الإكسل المنسّق (صيغ حيّة + تنسيقات) |
 | pandas / numpy / PyYAML | 3.0.6 / 2.5.3 / 6.0.3 | جداول البيانات، مصفوفات OCR، قراءة قواعد المورّدين |
@@ -34,7 +34,9 @@ engine="auto", ocr_engine=None, ocr_resolution=None, ocr_max_pages=None)` الت
 | الملف | الوظيفة بدقة |
 |---|---|
 | **`main.py`** | المنسّق (Orchestrator): دالة `run()` تمزج المسارين وتكتب الإكسل. `_resolve_engine()` يختار محرك الاستخراج. `ENGINES = ("auto", "text", "ocr")`. |
-| **`app.py`** | واجهة Streamlit: رفع PDF متعدد، شريط جانبي (وضع المعالجة: Auto/Text/OCR، اختيار المورّد يدويًا أو Auto-detect)، تنفيذ عبر `process_pdf()` → `main.run()`، عرض `st.dataframe` + أزرار تحميل `st.download_button` + رسائل نجاح/خطأ لكل ملف. يعمل بذاكرة مؤقتة (`tempfile.TemporaryDirectory`). |
+| **`server.py`** | خادم FastAPI (خلف واجهة الويب الجديدة). يقدّم `GET /` (الواجهة الثابتة)، وREST API: `GET/POST/DELETE /api/config` (تهيئة المورّد/المفتاح في `.env` عبر `set_key` دون كشف المفتاح)، `POST /api/extract` (رفع ملفات متعدد → `ai_extract.extract_invoice_to_dataframe` لكل ملف → `exporter.export_to_excel`)، و`GET /api/download/{id}`. يُقدّم أيضًا مجلد `static/` (index.html + app.js + styles.css: لوحة تحكّم حديثة بشريط جانبي عبر Tailwind). العمل الحاجب لنداء OpenAI يجري في خيط منفصل (`run_in_threadpool`). |
+| **`static/`** | الواجهة الأمامية (SPA بلا إطار عمل): `index.html` (شريط جانبي للتهيئة + منطقة رئيسية للرفع/النتائج/التحميل، Tailwind عبر CDN)، `app.js` (منطق vanilla JS يتحدّث مع `server.py`)، و`styles.css` (تنسيقات دعم الاتجاه من اليمين لليسار للنصوص العربية). |
+| **`main.py`** | مسار محلي منفصل (ليس جزءًا من الواجهة): دالة `run()` تمزج مسارَي النص/OCR وتكتب الإكسل، ويستخدمها سطر الأوامر و`tests/`. |
 | **`extractor_pdf.py`** | محرك النص: استخراج الجداول بـ pdfplumber، كشف صف العناوين (`detect_header_row`)، تنظيف الخلايا والعملات (`_clean_currency`)، تصحيح عربي الترتيب البصري (`_fix_arabic`)، فصل صفوف/جداول الملخّص (`_is_summary_table`, `_drop_summary_rows`)، كشف ضوضاء `(cid:NN)` (`has_cid_garbage`)، ومحرك الـ **Smart Fallback** للمورّدين المجهولين (`smart_extract_tables` / `smart_fallback_extract`). ثابت `DYNAMIC_SUPPLIER_KEY = "auto_detected"`. |
 | **`extractor_ocr.py`** | محرك البصري: تحويل الصفحات لصور (`render_pdf_pages`, افتراضي 300 DPI) مع زيادة التباين بدون تكبير (`preprocess_for_ocr`, `OCR_UPSCALE_FACTOR = 1.0` لتفادي OOM)، تغليف `PaddleOcrEngine` (كسول، يدعم API ‏v3/v2 مع تدرّج في التوافق)، تطبيع مخرجات Paddle (`_parse_paddle_result`)، إعادة بناء جدول من صناديق النص. **للمورّدين المعروفين:** `template_lines_to_table` يعيد البناء من قالب أعمدة مستنتَج من إحداثيات X لصف العناوين مع تقسيم صناديق الأرقام المدمجة غير المنقسمة بسطور (`_split_discrete_numeric_values`). للمجهولين: `lines_to_rows` (تجميع صارم) → `_header_bands`/`column_bands` → `lines_to_table`. وقطّاع التوجيه `should_use_ocr()`. `ocr_dependency_status()` / `is_ocr_available()` لحالة المحرك. |
 | **`formatter.py`** | المنسّق: تحويل لأي إطار إلى الهيكل القياسي `standard_columns`. مساران: `format_transactions()` بملف المورّد (`columns_mapping`، مع حلّ ضبابي لمفاتيحه على رؤوس الإطار عبر `_resolve_column`) أو `format_dynamic()` بالمطابقة الضبابية (`build_column_mapping` ← `best_standard_match` + `detect_header_currency`). كذلك: `detect_supplier()`, `frame_matches_profile()` (قبول ملف مورّد على مسار OCR)، تطبيع التواريخ إلى `YYYY-MM-DD`, أعداد `Adult/Child/Inf` صحيحة، طيّ زائد الأعمدة في `Notes`، ومرادفات متعددة اللغات `STANDARD_COLUMN_ALIASES` (عربية + معكوسة). عتبة القبول `FUZZY_MATCH_THRESHOLD = 0.80`. |
@@ -46,8 +48,8 @@ engine="auto", ocr_engine=None, ocr_resolution=None, ocr_max_pages=None)` الت
 | **`requirements.txt`** | الاعتمادات المقفولة، مع ملاحظات شرطية لـ OCR على Python ≥3.14. |
 | **`.devcontainer/devcontainer.json`** | حاوية التطوير. |
 
-**تشغيل:** `streamlit run app.py` للواجهة · `python main.py <pdf> [supplier] [engine]`
-للسطر · الاختبارات: `python -m pytest tests/ -v` أو مباشرة
+**تشغيل:** `uvicorn server:app --reload` للواجهة (تُفتح على http://127.0.0.1:8000) · `python main.py <pdf> [supplier] [engine]`
+لسطر أوامر المسار المحلي · الاختبارات: `python -m pytest tests/ -v` أو مباشرة
 `python tests/test_fallback_extractor.py` و`python tests/test_ocr_pipeline.py`
 (كل ملف يضمّ مشغّلًا ذاتيًا `_run_all()` لا يحتاج pytest).
 

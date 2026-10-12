@@ -5,4 +5,8 @@ openai
 python-dotenv
 pandas
 openpyxl
-streamlit
+# Web backend + static frontend (replaces the former Streamlit UI).
+fastapi
+uvicorn
+python-multipart
+

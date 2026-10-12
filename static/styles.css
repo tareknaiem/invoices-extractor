@@ -1,0 +1,57 @@
+/* styles.css — small custom touches on top of Tailwind utilities. */
+
+/* Ensure the flex layout fills the viewport height cleanly. */
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+/* Arabic text (hotel names, notes) should keep its natural direction and wrap. */
+td,
+th {
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+td[data-ar="1"],
+.rtl {
+  direction: rtl;
+  text-align: right;
+  white-space: normal;
+  min-width: 12rem;
+}
+
+
+/* Subtle spinner used while the extraction request is in flight. */
+.spinner {
+  display: inline-block;
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 9999px;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Custom scrollbars for the main content area. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

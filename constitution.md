@@ -6,7 +6,7 @@
 
 **نطاق التطبيق:** يشمل كل تعديل أو إضافة في مشروع `InvoicesExtractor`
 (`extractor_pdf.py`, `extractor_ocr.py`, `formatter.py`, `exporter.py`, `main.py`,
-`app.py`, `suppliers_rules.yaml`, `tests/`).
+`server.py`, `static/`, `suppliers_rules.yaml`, `tests/`).
 
 ---
 
@@ -23,7 +23,7 @@ formatter (formatter.py + suppliers_rules.yaml)
         ↓
 exporter (exporter.py)
         ↓
-app (app.py — Streamlit UI)
+app (server.py — FastAPI backend + static/ frontend)
 ```
 
 ### المتطلبات
@@ -48,10 +48,11 @@ app (app.py — Streamlit UI)
    - عدم كسر ترتيب الأعمدة القياسي ولا مواضع الخلايا الحساسة
      (`HEADER_ROW = 4`، خلايا أسعار الصرف `$B$2/$D$2/$F$2`).
 
-4. **تأكيد الظهور عبر Streamlit (`app.py`):**
+4. **تأكيد الظهور في الواجهة (`server.py` + `static/`):**
    - أي ميزة لا تظهر في الواجهة (خيارات، مؤشرات، نتائج، أزرار تحميل) تُعتبر **غير مكتملة**.
-   - يجب التأكد من: ظهور الحقل الجديد في `st.dataframe`، ووجوده داخل ملف الـ
-     `.xlsx` المُنزَّل عبر `st.download_button`، وظهور رسائل الحالة/الخطأ المرتبطة به.
+   - يجب التأكد من: ظهور الحقل الجديد في جدول النتائج (`static/app.js` → `renderTable`)،
+     ووجوده داخل ملف الـ `.xlsx` المُنزَّل عبر `GET /api/download/{id}`، وظهور رسائل
+     الحالة/الخطأ المرتبطة به في الواجهة.
 
 5. **الوَصل (Wiring) الإلزامي:** يُمنع دعم ميزة في مكوّن واحد فقط
    (مثل استخراج حقل لا يصل إلى الإكسل، أو إضافة خيار في الواجهة لا يمرّ إلى `main.run`).
@@ -94,7 +95,7 @@ app (app.py — Streamlit UI)
      (مثل «التاريخ»، «الفندق»، «إجمالي»، «صافي») أو في `suppliers_rules.yaml`.
    - تسمية صف الإجمالي العربية `الاجمالي` عبر
      `exporter.export_to_excel(total_label=...)` يجب أن تبقى مدعومة ومُختبَرة.
-   - واجهة Streamlit: الحفاظ على سلامة عرض النصوص العربية وعدم كسر اتجاهها.
+   - واجهة الويب (`server.py` + `static/`): الحفاظ على سلامة عرض النصوص العربية وعدم كسر اتجاهها.
 
 2. **الحفاظ على معادلات الإكسل الحية دون كسر الهيكل:**
    - **معادلات تحويل الجنيه (EGP Converter):** كل صف بيانات يحتوي معادلة حية
@@ -134,7 +135,7 @@ app (app.py — Streamlit UI)
 3. **خلو الكود من الأخطاء:**
    - التأكد من أن الوحدات تُستورد دون أخطاء:
      ```bash
-     python -c "import main, app, formatter, exporter, extractor_pdf, extractor_ocr"
+     python -c "import main, server, formatter, exporter, extractor_pdf, extractor_ocr"
      ```
    - عدم إبقاء أي كود مكسور أو أخطاء صياغة (syntax) أو استيرادات مكسورة.
 
@@ -142,7 +143,7 @@ app (app.py — Streamlit UI)
    المهمة قبل الإعلان عن اكتمالها.
 
 5. **التكامل الفعلي:** عند إضافة ميزة، إرفاق دليل قصير يؤكد ظهورها في:
-   (أ) بيانات الخرج، (ب) ملف الإكسل الناتج، (ج) واجهة Streamlit.
+   (أ) بيانات الخرج، (ب) ملف الإكسل الناتج، (ج) واجهة الويب (`server.py` + `static/`).
 
 ---
 
@@ -154,6 +155,6 @@ app (app.py — Streamlit UI)
 - [ ] دعم العربية سليم (OCR + تصحيح الترتيب + الأسماء العربية + `الاجمالي`).
 - [ ] معادلات `EGP Converter` الحية وصيغ `SUM` موجودة وسلامة هيكل الورقة محفوظة.
 - [ ] `pytest` مُشغَّل على كامل `tests/` بنسبة نجاح 100%.
-- [ ] الكود مستورد بلا أخطاء، والميزة ظاهرة في Streamlit.
+- [ ] الكود مستورد بلا أخطاء، والميزة ظاهرة في واجهة الويب (`server.py` + `static/`).
 
 
