@@ -161,11 +161,11 @@ async function loadConfig() {
       // Restore the saved model into the free-text field.
       modelInput.value = cfg.model || "";
     } else {
-      // Custom provider (or an unrecognised saved name) -> free-text fields.
-      providerInput.value = provider ? CUSTOM : "";
+      // Custom provider -> restore saved Base URL & Model
+      providerInput.value = CUSTOM;
       applyProvider(CUSTOM);
-      baseUrlInput.value = cfg.base_url || "";
-      modelInput.value = cfg.model || "";
+      if (cfg.base_url) baseUrlInput.value = cfg.base_url;
+      if (cfg.model) modelInput.value = cfg.model;
     }
     if (cfg.has_key) {
       keyStatus.textContent = "✓ A key is saved on the server.";
@@ -433,14 +433,14 @@ function renderResults(payload) {
   // Data table.
   if (payload.rows && payload.rows.length && payload.columns) {
     renderTable(payload.columns, payload.rows);
-    results.classList.remove("hidden");
   }
 
-  // Download button.
-  if (payload.download_id) {
-    downloadBtn.href = `/api/download/${payload.download_id}`;
-    downloadBtn.classList.remove("hidden");
-  }
+  // Download button (Fallback included)
+  const downloadId = payload.download_id || "latest";
+  downloadBtn.href = `/api/download/${downloadId}`;
+  downloadBtn.classList.remove("hidden");
+  // إظهار منطقة النتائج بالكامل فوراً
+  results.classList.remove("hidden");
 }
 
 function renderTable(columns, rows) {
